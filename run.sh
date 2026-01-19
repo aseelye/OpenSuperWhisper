@@ -5,6 +5,8 @@ if [[ "$1" == "build" ]]; then
     JUST_BUILD=true
 fi
 
+set -o pipefail
+
 # Configure libwhisper
 echo "Configuring libwhisper..."
 cmake -G Xcode -B libwhisper/build -S libwhisper
@@ -37,7 +39,7 @@ XCODE_LOG="$PWD/build/logs/xcodebuild.log"
 CMD=(xcodebuild -scheme OpenSuperWhisper -configuration Debug -jobs 8 -derivedDataPath build -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation -UseModernBuildSystem=YES -clonedSourcePackagesDirPath SourcePackages -skipUnavailableActions CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO OTHER_CODE_SIGN_FLAGS="--entitlements OpenSuperWhisper/OpenSuperWhisper.entitlements" build)
 
 "${CMD[@]}" 2>&1 | tee "$XCODE_LOG"
-BUILD_STATUS=${PIPESTATUS[0]}
+BUILD_STATUS=${pipestatus[1]}
 
 if command -v xcpretty &> /dev/null; then
     xcpretty --simple --color < "$XCODE_LOG"

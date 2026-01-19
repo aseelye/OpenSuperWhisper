@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
 # === Configuration Variables ===
 APP_NAME="OpenSuperWhisper"                                   
