@@ -73,7 +73,10 @@ final class AppPreferences {
     
     @UserDefault(key: "hasCompletedOnboarding", defaultValue: false)
     var hasCompletedOnboarding: Bool
-    
+
     @UserDefault(key: "useAsianAutocorrect", defaultValue: true)
     var useAsianAutocorrect: Bool
+
+    @UserDefault(key: "openAIRetryCount", defaultValue: 1)
+    var openAIRetryCount: Int
 }

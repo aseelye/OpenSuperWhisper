@@ -94,6 +94,17 @@ class SettingsViewModel: ObservableObject {
             AppPreferences.shared.useAsianAutocorrect = useAsianAutocorrect
         }
     }
+
+    @Published var openAIRetryCount: Int {
+        didSet {
+            let clamped = max(0, min(openAIRetryCount, 5))
+            if openAIRetryCount != clamped {
+                openAIRetryCount = clamped
+                return
+            }
+            AppPreferences.shared.openAIRetryCount = openAIRetryCount
+        }
+    }
     
     private let apiKeyStore = OpenAIAPIKeyStore.shared
 
@@ -112,6 +123,7 @@ class SettingsViewModel: ObservableObject {
         self.debugMode = prefs.debugMode
         self.playSoundOnRecordStart = prefs.playSoundOnRecordStart
         self.useAsianAutocorrect = prefs.useAsianAutocorrect
+        self.openAIRetryCount = prefs.openAIRetryCount
         self.openAIAPIKey = (try? apiKeyStore.loadKey()) ?? ""
         
         if let savedPath = prefs.selectedModelPath {
@@ -176,6 +188,7 @@ struct Settings {
     var useBeamSearch: Bool
     var beamSize: Int
     var useAsianAutocorrect: Bool
+    var openAIRetryCount: Int
     
     init() {
         let prefs = AppPreferences.shared
@@ -190,6 +203,7 @@ struct Settings {
         self.useBeamSearch = prefs.useBeamSearch
         self.beamSize = prefs.beamSize
         self.useAsianAutocorrect = prefs.useAsianAutocorrect
+        self.openAIRetryCount = prefs.openAIRetryCount
     }
 }
 
@@ -380,6 +394,27 @@ struct SettingsView: View {
                             Text(message)
                                 .font(.caption)
                                 .foregroundColor(viewModel.apiKeyStatusIsError ? .red : .secondary)
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Retry failed uploads")
+                                    .font(.subheadline)
+                                Spacer()
+                                Text("\(viewModel.openAIRetryCount)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Stepper(value: $viewModel.openAIRetryCount, in: 0...5) {
+                                EmptyView()
+                            }
+                            .labelsHidden()
+                            .help("Number of retry attempts for OpenAI uploads. 0 disables retries.")
+
+                            Text("Number of retry attempts per chunk when contacting OpenAI (0 disables retries).")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
 
                         Text("Your key is stored securely in the macOS Keychain and never leaves this Mac except when contacting OpenAI.")

@@ -44,13 +44,13 @@ class FileDropHandler: ObservableObject {
     
     func handleDrop(of providers: [NSItemProvider]) async {
         guard let provider = providers.first else { return }
-        
+
         // Double-check we're not already processing
         if isTranscribing {
             showProcessingError()
             return
         }
-        
+
         if provider.hasItemConformingToTypeIdentifier(UTType.audio.identifier) {
             do {
                 // Create a continuation to handle the non-Sendable NSItemProvider
@@ -63,14 +63,21 @@ class FileDropHandler: ObservableObject {
                         continuation.resume(returning: item as? URL)
                     }
                 }
-                
+
                 guard let url = url else {
                     print("Error loading item: not a URL")
                     return
                 }
-                
+
+                let needsAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if needsAccess {
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+
                 print("url: \(url)")
-                
+
                 // Get audio duration
                 let asset = AVAsset(url: url)
                 let duration = try await asset.load(.duration)
@@ -94,10 +101,19 @@ class FileDropHandler: ObservableObject {
                     transcription: text,
                     duration: fileDuration
                 ).url
-                
+
                 // Copy the file for playback
+                let directory = finalURL.deletingLastPathComponent()
+                if !FileManager.default.fileExists(atPath: directory.path) {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                }
+
+                if FileManager.default.fileExists(atPath: finalURL.path) {
+                    try FileManager.default.removeItem(at: finalURL)
+                }
+
                 try FileManager.default.copyItem(at: url, to: finalURL)
-                
+
                 // Save the recording to store
                 self.recordingStore.addRecording(
                     Recording(
@@ -109,11 +125,39 @@ class FileDropHandler: ObservableObject {
                     ))
                 
             } catch {
+                Task { @MainActor in
+                    self.present(error: error)
+                }
                 print("Error processing dropped audio file: \(error)")
             }
-            
+
             self.isTranscribing = false
             self.fileDuration = 0
+        }
+    }
+
+    private func present(error: Error) {
+        if let transcriptionError = error as? TranscriptionError {
+            switch transcriptionError {
+            case .missingAPIKey:
+                errorMessage = "OpenAI API key not found. Add one in Settings before using the OpenAI backend."
+            case let .fileTooLarge(limitMB):
+                errorMessage = "Audio file is larger than OpenAI's \(limitMB) MB limit. Please trim or compress it."
+            case let .openAIError(message):
+                errorMessage = "OpenAI transcription failed: \(message)"
+            case .contextInitializationFailed:
+                errorMessage = "Unable to load the local Whisper model. Check your model files in Settings."
+            case .audioConversionFailed:
+                errorMessage = "Failed to convert audio for transcription."
+            case .processingFailed:
+                errorMessage = "Transcription did not complete. Please try again."
+            }
+        } else {
+            errorMessage = error.localizedDescription
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.errorMessage = nil
         }
     }
 }

@@ -131,6 +131,8 @@ class ContentViewModel: ObservableObject {
             return "OpenAI API key not found. Add one in Settings ▸ Model before using the OpenAI backend."
         case let .openAIError(message):
             return "OpenAI transcription failed: \(message)"
+        case let .fileTooLarge(limitMB):
+            return "Audio file exceeds OpenAI's \(limitMB) MB limit. Try trimming or compressing it."
         case .contextInitializationFailed:
             return "Unable to load the local Whisper model. Check your model files in Settings ▸ Model."
         case .audioConversionFailed:

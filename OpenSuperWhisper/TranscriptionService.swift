@@ -19,6 +19,10 @@ class TranscriptionService: ObservableObject {
     private var abortFlag: UnsafeMutablePointer<Bool>? = nil
     private let openAIClient = OpenAITranscriptionClient()
     private let apiKeyStore = OpenAIAPIKeyStore.shared
+    private let openAIChunkMaxDuration: TimeInterval = 6 * 60
+    private let openAIChunkMinDuration: TimeInterval = 30
+    private let openAIChunkSizeMarginBytes = 512 * 1024
+    private let openAIFileSizeLimitBytes = 25 * 1024 * 1024
     
     init() {
         loadModel()
@@ -314,17 +318,27 @@ class TranscriptionService: ObservableObject {
         let task = Task.detached(priority: .userInitiated) { [self] in
             try Task.checkCancellation()
 
+            let asset = AVAsset(url: url)
+            let durationValue = try await asset.load(.duration)
+            let totalSeconds = CMTimeGetSeconds(durationValue)
+            let fileSize = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+
             await MainActor.run {
                 self.currentSegment = "Contacting OpenAI..."
                 self.progress = 0.1
             }
 
             do {
-                let transcript = try await openAIClient.transcribeAudio(at: url, settings: settings, apiKey: apiKey)
+                let rawTranscript: String
+                if fileSize > openAIFileSizeLimitBytes || totalSeconds > openAIChunkMaxDuration {
+                    rawTranscript = try await self.transcribeWithOpenAIChunks(asset: asset, totalSeconds: totalSeconds, settings: settings, apiKey: apiKey)
+                } else {
+                    rawTranscript = try await self.transcribeOpenAIFileWithRetries(fileURL: url, settings: settings, apiKey: apiKey)
+                }
 
                 try Task.checkCancellation()
 
-                let cleaned = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+                let cleaned = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
                 var processedText = cleaned
                 if ["zh", "ja", "ko"].contains(settings.selectedLanguage) && settings.useAsianAutocorrect && !cleaned.isEmpty {
                     processedText = AutocorrectWrapper.format(cleaned)
@@ -341,8 +355,6 @@ class TranscriptionService: ObservableObject {
 
                 return finalText
             } catch let error as OpenAITranscriptionClientError {
-                throw TranscriptionError.openAIError(error.localizedDescription)
-            } catch {
                 throw TranscriptionError.openAIError(error.localizedDescription)
             }
         }
@@ -362,6 +374,174 @@ class TranscriptionService: ObservableObject {
             throw error
         } catch {
             throw TranscriptionError.openAIError(error.localizedDescription)
+        }
+    }
+
+
+    private func transcribeWithOpenAIChunks(asset: AVAsset, totalSeconds: Double, settings: Settings, apiKey: String) async throws -> String {
+        try Task.checkCancellation()
+
+        let targetLimitBytes = max(openAIFileSizeLimitBytes - openAIChunkSizeMarginBytes, openAIChunkSizeMarginBytes)
+        let estimatedBitrate = Double(asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 64000)
+        let maxSecondsBySize = estimatedBitrate > 0 ? Double(targetLimitBytes * 8) / estimatedBitrate : openAIChunkMaxDuration
+
+        var chunkDuration = min(openAIChunkMaxDuration, maxSecondsBySize)
+        if !chunkDuration.isFinite || chunkDuration <= 0 {
+            chunkDuration = openAIChunkMaxDuration
+        }
+        chunkDuration = max(openAIChunkMinDuration, chunkDuration)
+        chunkDuration = min(chunkDuration, totalSeconds)
+
+        let totalChunks = max(1, Int(ceil(totalSeconds / chunkDuration)))
+        let tempDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("osw-openai-chunks", isDirectory: true)
+        try? FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+
+        var transcripts: [String] = []
+        var start: Double = 0
+        let progressBase: Float = 0.1
+        let progressRange: Float = 0.9
+
+        for chunkIndex in 0..<totalChunks {
+            try Task.checkCancellation()
+            let remaining = totalSeconds - start
+            let duration = min(chunkDuration, remaining)
+            let chunkURL = tempDirectory.appendingPathComponent("chunk-\(UUID().uuidString).m4a")
+
+            let exportedURL = try await exportAudioChunk(asset: asset, start: start, duration: duration, outputURL: chunkURL, fileLimit: targetLimitBytes)
+            defer { try? FileManager.default.removeItem(at: exportedURL) }
+
+            let resourceValues = try exportedURL.resourceValues(forKeys: Set([.fileSizeKey]))
+            let chunkFileSize = resourceValues.fileSize ?? 0
+            if chunkFileSize > openAIFileSizeLimitBytes {
+                throw TranscriptionError.fileTooLarge(limitMB: openAIFileSizeLimitBytes / (1024 * 1024))
+            }
+
+            await MainActor.run {
+                self.currentSegment = "Transcribing chunk \(chunkIndex + 1) of \(totalChunks)..."
+                self.progress = progressBase + (Float(chunkIndex) / Float(totalChunks)) * progressRange
+            }
+
+            do {
+                let chunkTranscript = try await transcribeOpenAIFileWithRetries(fileURL: exportedURL, settings: settings, apiKey: apiKey)
+                transcripts.append(chunkTranscript)
+            } catch is CancellationError {
+                throw TranscriptionError.processingFailed
+            } catch let error as OpenAITranscriptionClientError {
+                throw TranscriptionError.openAIError(error.localizedDescription)
+            }
+
+            await MainActor.run {
+                self.progress = progressBase + (Float(chunkIndex + 1) / Float(totalChunks)) * progressRange
+            }
+            start += duration
+        }
+
+        return transcripts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func transcribeOpenAIFileWithRetries(fileURL: URL, settings: Settings, apiKey: String) async throws -> String {
+        try await performOpenAIRequestWithRetries(settings: settings) {
+            try await self.openAIClient.transcribeAudio(at: fileURL, settings: settings, apiKey: apiKey)
+        }
+    }
+
+    private func performOpenAIRequestWithRetries<T>(settings: Settings, operation: @escaping () async throws -> T) async throws -> T {
+        let maxRetries = max(0, settings.openAIRetryCount)
+        var attempt = 0
+
+        while true {
+            try Task.checkCancellation()
+
+            do {
+                return try await operation()
+            } catch {
+                guard attempt < maxRetries, shouldRetryOpenAI(error: error) else {
+                    throw error
+                }
+
+                attempt += 1
+
+                if AppPreferences.shared.debugMode {
+                    print("OpenAI transcription retry #\(attempt) due to: \(error.localizedDescription)")
+                }
+
+                let delaySeconds = min(pow(2.0, Double(attempt)), 8.0)
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            }
+        }
+    }
+
+    private func shouldRetryOpenAI(error: Error) -> Bool {
+        if let clientError = error as? OpenAITranscriptionClientError {
+            switch clientError {
+            case .invalidURL, .decodingFailed:
+                return false
+            case let .httpError(status, _):
+                return status == 408 || status == 425 || status == 429 || (500...599).contains(status)
+            case let .network(urlError):
+                return shouldRetry(urlError: urlError)
+            }
+        }
+
+        if let urlError = error as? URLError {
+            return shouldRetry(urlError: urlError)
+        }
+
+        return false
+    }
+
+    private func shouldRetry(urlError: URLError) -> Bool {
+        switch urlError.code {
+        case .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .dnsLookupFailed,
+             .networkConnectionLost,
+             .notConnectedToInternet,
+             .secureConnectionFailed,
+             .cannotLoadFromNetwork,
+             .resourceUnavailable:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func exportAudioChunk(asset: AVAsset, start: Double, duration: Double, outputURL: URL, fileLimit: Int) async throws -> URL {
+        guard duration > 0 else {
+            throw TranscriptionError.audioConversionFailed
+        }
+
+        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            throw TranscriptionError.audioConversionFailed
+        }
+
+        let timescale: CMTimeScale = asset.duration.timescale != 0 ? asset.duration.timescale : 600
+        let startTime = CMTime(seconds: start, preferredTimescale: timescale)
+        let durationTime = CMTime(seconds: duration, preferredTimescale: timescale)
+
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .m4a
+        exportSession.shouldOptimizeForNetworkUse = true
+        exportSession.timeRange = CMTimeRange(start: startTime, duration: durationTime)
+        exportSession.fileLengthLimit = Int64(fileLimit)
+
+        return try await withCheckedThrowingContinuation { continuation in
+            exportSession.exportAsynchronously {
+                switch exportSession.status {
+                case .completed:
+                    continuation.resume(returning: outputURL)
+                case .failed:
+                    continuation.resume(throwing: exportSession.error ?? TranscriptionError.audioConversionFailed)
+                case .cancelled:
+                    continuation.resume(throwing: TranscriptionError.processingFailed)
+                default:
+                    continuation.resume(throwing: TranscriptionError.audioConversionFailed)
+                }
+            }
         }
     }
 
@@ -457,6 +637,7 @@ enum TranscriptionError: Error {
     case processingFailed
     case missingAPIKey
     case openAIError(String)
+    case fileTooLarge(limitMB: Int)
 }
 
 struct OpenAITranscriptionResponse: Decodable {
@@ -476,6 +657,7 @@ enum OpenAITranscriptionClientError: LocalizedError {
     case invalidURL
     case httpError(status: Int, message: String?)
     case decodingFailed
+    case network(URLError)
 
     var errorDescription: String? {
         switch self {
@@ -489,6 +671,8 @@ enum OpenAITranscriptionClientError: LocalizedError {
             }
         case .decodingFailed:
             return "Unable to decode OpenAI response."
+        case let .network(error):
+            return "Network error contacting OpenAI: \(error.localizedDescription)"
         }
     }
 }
@@ -498,8 +682,15 @@ final class OpenAITranscriptionClient {
     private let endpoint = "https://api.openai.com/v1/audio/transcriptions"
     private let model = "whisper-1"
 
-    init(session: URLSession = .shared) {
-        self.session = session
+    init(session: URLSession? = nil) {
+        if let session = session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = 300
+            configuration.timeoutIntervalForResource = 600
+            self.session = URLSession(configuration: configuration)
+        }
     }
 
     func transcribeAudio(at fileURL: URL, settings: Settings, apiKey: String) async throws -> String {
@@ -521,7 +712,13 @@ final class OpenAITranscriptionClient {
         )
         request.httpBody = body
 
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let urlError as URLError {
+            throw OpenAITranscriptionClientError.network(urlError)
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw OpenAITranscriptionClientError.decodingFailed
