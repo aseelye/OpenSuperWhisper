@@ -55,17 +55,13 @@ class TranscriptionService: ObservableObject {
         print("Loading model")
         if let modelPath = AppPreferences.shared.selectedModelPath {
             isLoading = true
-            
-            // Capture the weak self reference before the task
-            weak var weakSelf = self
-            
-            Task.detached(priority: .userInitiated) {
+
+            Task.detached(priority: .userInitiated) { [weak self] in
                 let params = WhisperContextParams()
                 let newContext = MyWhisperContext.initFromFile(path: modelPath, params: params)
                 
-                await MainActor.run {
-                    // Use the weak self reference inside MainActor.run
-                    guard let self = weakSelf else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
                     self.context = newContext
                     self.isLoading = false
                     print("Model loaded")
@@ -77,17 +73,13 @@ class TranscriptionService: ObservableObject {
     func reloadModel(with path: String) {
         print("Reloading model")
         isLoading = true
-        
-        // Capture the weak self reference before the task
-        weak var weakSelf = self
-        
-        Task.detached(priority: .userInitiated) {
+
+        Task.detached(priority: .userInitiated) { [weak self] in
             let params = WhisperContextParams()
             let newContext = MyWhisperContext.initFromFile(path: path, params: params)
             
-            await MainActor.run {
-                // Use the weak self reference inside MainActor.run
-                guard let self = weakSelf else { return }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
                 self.context = newContext
                 self.isLoading = false
                 print("Model reloaded")
@@ -382,7 +374,19 @@ class TranscriptionService: ObservableObject {
         try Task.checkCancellation()
 
         let targetLimitBytes = max(openAIFileSizeLimitBytes - openAIChunkSizeMarginBytes, openAIChunkSizeMarginBytes)
-        let estimatedBitrate = Double(asset.tracks(withMediaType: .audio).first?.estimatedDataRate ?? 64000)
+        let estimatedBitrate: Double
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .audio)
+            if let track = tracks.first {
+                let rate = try await track.load(.estimatedDataRate)
+                let numericRate = Double(rate)
+                estimatedBitrate = numericRate.isFinite && numericRate > 0 ? numericRate : 64000
+            } else {
+                estimatedBitrate = 64000
+            }
+        } catch {
+            estimatedBitrate = 64000
+        }
         let maxSecondsBySize = estimatedBitrate > 0 ? Double(targetLimitBytes * 8) / estimatedBitrate : openAIChunkMaxDuration
 
         var chunkDuration = min(openAIChunkMaxDuration, maxSecondsBySize)
@@ -519,7 +523,8 @@ class TranscriptionService: ObservableObject {
             throw TranscriptionError.audioConversionFailed
         }
 
-        let timescale: CMTimeScale = asset.duration.timescale != 0 ? asset.duration.timescale : 600
+        let assetDuration = try await asset.load(.duration)
+        let timescale: CMTimeScale = assetDuration.timescale != 0 ? assetDuration.timescale : 600
         let startTime = CMTime(seconds: start, preferredTimescale: timescale)
         let durationTime = CMTime(seconds: duration, preferredTimescale: timescale)
 
@@ -529,8 +534,10 @@ class TranscriptionService: ObservableObject {
         exportSession.timeRange = CMTimeRange(start: startTime, duration: durationTime)
         exportSession.fileLengthLimit = Int64(fileLimit)
 
+        let exportSessionBox = UncheckedSendableBox(exportSession)
         return try await withCheckedThrowingContinuation { continuation in
             exportSession.exportAsynchronously {
+                let exportSession = exportSessionBox.value
                 switch exportSession.status {
                 case .completed:
                     continuation.resume(returning: outputURL)
@@ -542,6 +549,14 @@ class TranscriptionService: ObservableObject {
                     continuation.resume(throwing: TranscriptionError.audioConversionFailed)
                 }
             }
+        }
+    }
+
+    private final class UncheckedSendableBox<T>: @unchecked Sendable {
+        let value: T
+
+        init(_ value: T) {
+            self.value = value
         }
     }
 

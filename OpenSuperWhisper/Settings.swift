@@ -264,7 +264,7 @@ struct SettingsView: View {
         .onAppear {
             previousModelURL = viewModel.selectedModelURL
         }
-        .onChange(of: viewModel.transcriptionBackend) { backend in
+        .onChange(of: viewModel.transcriptionBackend) { _, backend in
             if backend == .openAI {
                 viewModel.reloadOpenAIAPIKeyFromStore()
             } else {
@@ -367,7 +367,7 @@ struct SettingsView: View {
 
                         SecureField("sk-...", text: $viewModel.openAIAPIKey)
                             .textFieldStyle(.roundedBorder)
-                            .onChange(of: viewModel.openAIAPIKey) { _ in
+                            .onChange(of: viewModel.openAIAPIKey) { _, _ in
                                 viewModel.clearAPIKeyStatus()
                             }
 

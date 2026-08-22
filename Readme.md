@@ -48,6 +48,8 @@ To build locally, you'll need:
     cd OpenSuperWhisper
     git submodule update --init --recursive
     brew install cmake
+    # Install Rust (cargo), e.g. via rustup or Homebrew:
+    # brew install rust
     ./run.sh build
 
 In case of problems, consult `.github/workflows/build.yml` which is our CI workflow

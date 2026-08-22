@@ -12,7 +12,7 @@ CODE_SIGN_IDENTITY="${1}"
 DEVELOPMENT_TEAM="8LLDD7HWZK"
 
 rm -rf libwhisper/build
-cmake -G Xcode -B libwhisper/build -S libwhisper
+cmake -G Xcode -B libwhisper/build -S libwhisper -DWHISPER_ALL_WARNINGS=OFF -DGGML_ALL_WARNINGS=OFF
 
 rm -rf build
 mkdir -p build
