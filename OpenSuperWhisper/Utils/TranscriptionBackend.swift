@@ -1,26 +1,43 @@
 import Foundation
 
 enum TranscriptionBackend: String, CaseIterable, Identifiable {
-    case local
+    /// Apple's on-device SpeechAnalyzer/SpeechTranscriber pipeline.
+    case appleSpeech
     case openAI
+
+    /// `local` was the value persisted by releases that used whisper.cpp.
+    /// Keep accepting it at the boundary so an upgrade never silently falls
+    /// back to a cloud provider. New writes always use `appleSpeech`.
+    init?(rawValue: String) {
+        switch rawValue {
+        case "local":
+            self = .appleSpeech
+        case "appleSpeech":
+            self = .appleSpeech
+        case "openAI":
+            self = .openAI
+        default:
+            return nil
+        }
+    }
     
     var id: String { rawValue }
     
     var displayName: String {
         switch self {
-        case .local:
-            return "On-device (Whisper.cpp)"
+        case .appleSpeech:
+            return "Apple Speech"
         case .openAI:
-            return "OpenAI Whisper API"
+            return "OpenAI"
         }
     }
     
     var helpText: String {
         switch self {
-        case .local:
-            return "Runs entirely on your Mac using downloaded ggml models."
+        case .appleSpeech:
+            return "Private, on-device transcription powered by macOS Speech."
         case .openAI:
-            return "Uploads audio to OpenAI for transcription. Requires an API key."
+            return "Uploads completed recordings to OpenAI. Requires an API key."
         }
     }
 }

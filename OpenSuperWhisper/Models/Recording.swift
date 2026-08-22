@@ -7,6 +7,34 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
     let fileName: String
     let transcription: String
     let duration: TimeInterval
+    /// Nullable so rows written before the metadata migration remain valid.
+    let backend: String?
+    /// The locale used by the selected transcription backend, if known.
+    let locale: String?
+    /// JSON encoded `[TranscriptSegment]`, if the backend supplied
+    /// timed segments.  OpenAI's general-purpose model intentionally leaves
+    /// this nil.
+    let encodedTranscriptSegments: Data?
+
+    init(
+        id: UUID,
+        timestamp: Date,
+        fileName: String,
+        transcription: String,
+        duration: TimeInterval,
+        backend: String? = nil,
+        locale: String? = nil,
+        encodedTranscriptSegments: Data? = nil
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.fileName = fileName
+        self.transcription = transcription
+        self.duration = duration
+        self.backend = backend
+        self.locale = locale
+        self.encodedTranscriptSegments = encodedTranscriptSegments
+    }
 
     static func == (lhs: Recording, rhs: Recording) -> Bool {
         return lhs.id == rhs.id
@@ -24,6 +52,27 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
         Self.recordingsDirectory.appendingPathComponent(fileName)
     }
 
+    /// Decoded timing metadata for history details.  A malformed payload is
+    /// treated as absent rather than making an otherwise playable recording
+    /// unreadable.
+    var transcriptSegments: [TranscriptSegment] {
+        guard let encodedTranscriptSegments else { return [] }
+        return (try? JSONDecoder().decode(
+            [TranscriptSegment].self,
+            from: encodedTranscriptSegments
+        )) ?? []
+    }
+
+    /// Encodes engine segments without coupling the database model to an
+    /// engine module.  Callers can map their provider-neutral segments to this
+    /// shape at the session boundary.
+    static func encodeTranscriptSegments(
+        _ segments: [TranscriptSegment]
+    ) -> Data? {
+        guard !segments.isEmpty else { return nil }
+        return try? JSONEncoder().encode(segments)
+    }
+
     // MARK: - Database Table Definition
 
     static let databaseTableName = "recordings"
@@ -34,6 +83,9 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
         static let fileName = Column(CodingKeys.fileName)
         static let transcription = Column(CodingKeys.transcription)
         static let duration = Column(CodingKeys.duration)
+        static let backend = Column(CodingKeys.backend)
+        static let locale = Column(CodingKeys.locale)
+        static let encodedTranscriptSegments = Column(CodingKeys.encodedTranscriptSegments)
     }
 }
 
@@ -44,13 +96,23 @@ class RecordingStore: ObservableObject {
     @Published private(set) var recordings: [Recording] = []
     private let dbQueue: DatabaseQueue
 
-    private init() {
+    /// Creates a store at the app's normal database path.  A path can be
+    /// supplied by tests (or another app composition root) so schema
+    /// migration can be exercised without touching the user's history.
+    init(databasePath: URL? = nil, automaticallyLoad: Bool = true) {
         // Setup database
-        let applicationSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first!
-        let appDirectory = applicationSupport.appendingPathComponent(Bundle.main.bundleIdentifier!)
-        let dbPath = appDirectory.appendingPathComponent("recordings.sqlite")
+        let dbPath: URL
+        let appDirectory: URL
+        if let databasePath {
+            dbPath = databasePath
+            appDirectory = databasePath.deletingLastPathComponent()
+        } else {
+            let applicationSupport = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first!
+            appDirectory = applicationSupport.appendingPathComponent(Bundle.main.bundleIdentifier!)
+            dbPath = appDirectory.appendingPathComponent("recordings.sqlite")
+        }
 
         print("Database path: \(dbPath.path)")
 
@@ -59,8 +121,10 @@ class RecordingStore: ObservableObject {
                 at: appDirectory, withIntermediateDirectories: true)
             dbQueue = try DatabaseQueue(path: dbPath.path)
             try setupDatabase()
-            Task {
-                await loadRecordings()
+            if automaticallyLoad {
+                Task {
+                    await loadRecordings()
+                }
             }
         } catch {
             fatalError("Failed to setup database: \(error)")
@@ -75,6 +139,31 @@ class RecordingStore: ObservableObject {
                 t.column("fileName", .text).notNull()
                 t.column("transcription", .text).notNull().indexed().collate(.nocase)
                 t.column("duration", .double).notNull()
+                // Metadata is nullable by design: rows from older versions
+                // have no backend, locale, or timed segments.
+                t.column("backend", .text)
+                t.column("locale", .text)
+                t.column("encodedTranscriptSegments", .blob)
+            }
+
+            // `ifNotExists` does not alter an existing table.  Add each field
+            // independently so partially migrated databases are recoverable.
+            let existingColumns = try db.columns(in: Recording.databaseTableName)
+                .map(\.name)
+            if !existingColumns.contains("backend") {
+                try db.alter(table: Recording.databaseTableName) { t in
+                    t.add(column: "backend", .text)
+                }
+            }
+            if !existingColumns.contains("locale") {
+                try db.alter(table: Recording.databaseTableName) { t in
+                    t.add(column: "locale", .text)
+                }
+            }
+            if !existingColumns.contains("encodedTranscriptSegments") {
+                try db.alter(table: Recording.databaseTableName) { t in
+                    t.add(column: "encodedTranscriptSegments", .blob)
+                }
             }
         }
     }
@@ -98,15 +187,21 @@ class RecordingStore: ObservableObject {
         }
     }
 
-    func addRecording(_ recording: Recording) {
-        Task {
-            do {
-                try await insertRecording(recording)
-                await loadRecordings()
-            } catch {
-                print("Failed to add recording: \(error)")
-            }
-        }
+    /// Inserts a history row and refreshes the published list before
+    /// returning. Callers that moved/copied an audio file can therefore wait
+    /// for the database result and roll the file back if insertion fails.
+    func addRecording(_ recording: Recording) async throws {
+        try await insertRecording(recording)
+        await loadRecordings()
+    }
+
+    /// Removes a history row and refreshes the published list before
+    /// returning. This is used to compensate a persistence operation when
+    /// cancellation arrives after insertion but before the session can report
+    /// success.
+    func removeRecording(_ recording: Recording) async throws {
+        try await deleteRecordingFromDB(recording)
+        await loadRecordings()
     }
     
     private nonisolated func insertRecording(_ recording: Recording) async throws {

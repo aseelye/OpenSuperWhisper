@@ -46,7 +46,7 @@ class AudioRecorder: NSObject, ObservableObject {
         
         // Add observer for device connection/disconnection
         notificationObserver = NotificationCenter.default.addObserver(
-            forName: .AVCaptureDeviceWasConnected,
+            forName: AVCaptureDevice.wasConnectedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -59,7 +59,7 @@ class AudioRecorder: NSObject, ObservableObject {
         }
         
         NotificationCenter.default.addObserver(
-            forName: .AVCaptureDeviceWasDisconnected,
+            forName: AVCaptureDevice.wasDisconnectedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -80,7 +80,7 @@ class AudioRecorder: NSObject, ObservableObject {
         }
     }
     
-    private func playNotificationSound() {
+    func playRecordingStartSound() {
         // Try to play using NSSound first
         guard let soundURL = Bundle.main.url(forResource: "notification", withExtension: "mp3") else {
             print("Failed to find notification sound file")
@@ -116,7 +116,7 @@ class AudioRecorder: NSObject, ObservableObject {
         }
         
         if AppPreferences.shared.playSoundOnRecordStart {
-            playNotificationSound()
+            playRecordingStartSound()
         }
         
         let timestamp = Int(Date().timeIntervalSince1970)

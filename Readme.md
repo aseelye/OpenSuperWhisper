@@ -1,6 +1,6 @@
 # OpenSuperWhisper
 
-OpenSuperWhisper is a macOS application that provides real-time audio transcription using the Whisper model. It offers a seamless way to record and transcribe audio with customizable settings and keyboard shortcuts.
+OpenSuperWhisper is a macOS dictation app built around Apple’s on-device Speech framework. It transcribes locally after the selected language asset is installed, with an optional OpenAI `gpt-transcribe` backend for completed recordings.
 
 <p align="center">
 <img src="docs/image.png" width="400" /> <img src="docs/image_indicator.png" width="400" />
@@ -22,16 +22,17 @@ Or from [github releases page](https://github.com/Starmel/OpenSuperWhisper/relea
 
 ## Features
 
-- 🎙️ Real-time audio recording and transcription
-- ⌨️ Global keyboard shortcuts for quick recording (use ```cmd + ` ```)
-- 🌍 Support for multiple languages with auto-detection (not tested, but probably works)
-- 🔄 Optional translation to English (for better translation add initial prompt with english sentences)
+- 🎙️ Local audio recording and progressive transcription with Apple Speech
+- ⌨️ Global keyboard shortcuts for quick recording
+- 🌍 Apple-supported language and locale selection
+- ☁️ Optional post-recording uploads through OpenAI `gpt-transcribe`
 - 💾 Local storage of recordings with transcriptions
-- 🎛️ Advanced transcription settings (not tested)
+- 🔒 Local-first privacy: Apple transcription works offline after its language asset is installed
 
 ## Requirements
 
-- macOS (Apple Silicon/ARM64)
+- macOS 26 or later
+- Apple Silicon (ARM64) Mac
 
 ## Support
 
@@ -46,11 +47,9 @@ To build locally, you'll need:
 
     git clone git@github.com:Starmel/OpenSuperWhisper.git
     cd OpenSuperWhisper
-    git submodule update --init --recursive
-    brew install cmake
-    # Install Rust (cargo), e.g. via rustup or Homebrew:
-    # brew install rust
     ./run.sh build
+
+The script invokes `xcodebuild` directly. Install Xcode 26, select it with `xcode-select`, and grant microphone and accessibility permissions when launching the app. Only Xcode and the existing Swift packages are required; there are no model downloads.
 
 In case of problems, consult `.github/workflows/build.yml` which is our CI workflow
 where the app gets built automatically on GitHub's CI.
@@ -61,7 +60,7 @@ Contributions are welcome! Please feel free to submit pull requests or create is
 
 ### Contribution TODO list
 
-- [ ] Streaming transcription ([#22](https://github.com/Starmel/OpenSuperWhisper/issues/22))
+- [x] Progressive transcription with Apple Speech ([#22](https://github.com/Starmel/OpenSuperWhisper/issues/22))
 - [ ] Custom dictionary ([#20](https://github.com/Starmel/OpenSuperWhisper/issues/35))
 - [ ] Intel macOS compatibility ([#16](https://github.com/Starmel/OpenSuperWhisper/issues/16))
 - [ ] Agent mode ([#14](https://github.com/Starmel/OpenSuperWhisper/issues/14))
@@ -72,6 +71,6 @@ Contributions are welcome! Please feel free to submit pull requests or create is
 
 OpenSuperWhisper is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
-## Whisper Models
+## Transcription backends
 
-You can download Whisper model files (`.bin`) from the [Whisper.cpp Hugging Face repository](https://huggingface.co/ggerganov/whisper.cpp/tree/main). Place the downloaded `.bin` files in the app's models directory. On first launch, the app will attempt to copy a default model automatically, but you can add more models manually.
+Apple Speech is the default backend and runs on-device once its language asset is installed. The app does not download or bundle model files. If you choose OpenAI in Settings, add an API key; recordings are uploaded only after you stop recording and are sent to the `gpt-transcribe` model.

@@ -1,326 +1,302 @@
-//
-//  OnboardingView.swift
-//  OpenSuperWhisper
-//
-//  Created by user on 08.02.2025.
-//
-
-import Foundation
 import SwiftUI
 
-class OnboardingViewModel: ObservableObject {
-    @Published var selectedLanguage: String {
+/// First-run setup asks for one language and prepares its Apple Speech asset.
+/// The completed-onboarding flag is owned by `AppState` and is never reset by
+/// locale migration, so existing users go straight back to the main app.
+@MainActor
+final class OnboardingViewModel: ObservableObject {
+    @Published var selectedLocaleIdentifier: String {
         didSet {
-            AppPreferences.shared.whisperLanguage = selectedLanguage
-        }
-    }
-
-    @Published var selectedModel: DownloadableModel?
-    @Published var models: [DownloadableModel]
-    @Published var isDownloadingAny: Bool = false
-
-    private let modelManager = WhisperModelManager.shared
-
-    init() {
-        let systemLanguage = LanguageUtil.getSystemLanguage()
-        AppPreferences.shared.whisperLanguage = systemLanguage
-        self.selectedLanguage = systemLanguage
-        self.models = []
-        initializeModels()
-
-        if let defaultModel = models.first(where: { $0.name == "Turbo V3 large" }) {
-            self.selectedModel = defaultModel
-        }
-    }
-
-    private func initializeModels() {
-        // Initialize models with their actual download status
-        models = availableModels.map { model in
-            var updatedModel = model
-            updatedModel.isDownloaded = modelManager.isModelDownloaded(name: model.name)
-            return updatedModel
-        }
-    }
-
-    @MainActor
-    func downloadSelectedModel() async throws {
-        guard let model = selectedModel, !model.isDownloaded else { return }
-
-        guard !isDownloadingAny else { return }
-        isDownloadingAny = true
-
-        do {
-            // Find the index of the model we're downloading
-            guard let modelIndex = models.firstIndex(where: { $0.name == model.name }) else {
-                isDownloadingAny = false
+            let normalized = LanguageUtil.normalizedLocaleIdentifier(selectedLocaleIdentifier)
+            if normalized != selectedLocaleIdentifier {
+                selectedLocaleIdentifier = normalized
                 return
             }
+            AppPreferences.shared.localeIdentifier = normalized
+            cancelProgressObservation()
+            status = nil
+            errorMessage = nil
+            refreshAssetStatus()
+        }
+    }
 
-            // Start the download with progress updates
+    @Published private(set) var availableLocaleIdentifiers: [String]
+    @Published private(set) var status: AppleSpeechAssetStatus?
+    @Published private(set) var isPreparing = false
+    @Published var errorMessage: String?
 
-            let filename = model.url.lastPathComponent
+    private let assetManager: any AppleSpeechAssetManaging
+    private var statusTask: Task<Void, Never>?
+    private var progressTask: Task<Void, Never>?
 
-            try await modelManager.downloadModel(url: model.url, name: filename) { [weak self] progress in
+    init(assetManager: (any AppleSpeechAssetManaging)? = nil) {
+        let resolvedAssetManager = assetManager ?? AppleSpeechAssetManager.shared
+        let prefs = AppPreferences.shared
+        self.selectedLocaleIdentifier = prefs.localeIdentifier
+        self.availableLocaleIdentifiers = LanguageUtil.availableLocaleIdentifiers
+        self.assetManager = resolvedAssetManager
+    }
 
-                DispatchQueue.main.async {
-                    self?.models[modelIndex].downloadProgress = progress
-                    if progress >= 1.0 {
-                        self?.models[modelIndex].isDownloaded = true
-                        self?.isDownloadingAny = false
-                        // Update the model path after successful download
-                        if let modelPath = self?.modelManager.modelsDirectory.appendingPathComponent(filename).path {
-                            AppPreferences.shared.selectedModelPath = modelPath
-                            print("Model path after download: \(modelPath)")
-                        }
-                    }
+    var selectedLocale: Locale { LanguageUtil.locale(for: selectedLocaleIdentifier) }
+    var selectedLocaleDisplayName: String { LanguageUtil.displayName(for: selectedLocaleIdentifier) }
+    var isReady: Bool { status?.isReady == true }
+
+    func refresh() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let locales = await assetManager.refresh()
+            if !locales.isEmpty {
+                availableLocaleIdentifiers = LanguageUtil.localeIdentifiers(for: locales)
+                if !availableLocaleIdentifiers.contains(where: { $0.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame }) {
+                    selectedLocaleIdentifier = LanguageUtil.defaultLocaleIdentifier
                 }
             }
-        } catch {
-            print("Failed to download model: \(error)")
-            if let modelIndex = models.firstIndex(where: { $0.name == model.name }) {
-                models[modelIndex].downloadProgress = 0
-            }
-            isDownloadingAny = false
-            throw error
+            refreshAssetStatus()
         }
+    }
+
+    func refreshAssetStatus() {
+        statusTask?.cancel()
+        cancelProgressObservation()
+        let locale = selectedLocale
+        let requestedIdentifier = LanguageUtil.localeIdentifier(for: locale)
+        let assetManager = self.assetManager
+        statusTask = Task { @MainActor [weak self] in
+            let refreshedStatus = await assetManager.status(for: locale)
+            guard let self,
+                  !Task.isCancelled,
+                  requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                return
+            }
+            status = refreshedStatus
+        }
+    }
+
+    func prepareAsset() {
+        guard !isPreparing else { return }
+        statusTask?.cancel()
+        statusTask = nil
+        cancelProgressObservation()
+        let requestedLocale = selectedLocale
+        let requestedIdentifier = LanguageUtil.localeIdentifier(for: requestedLocale)
+        isPreparing = true
+        errorMessage = nil
+        status = AppleSpeechAssetStatus(locale: requestedLocale, state: .downloading, progress: 0)
+        observePreparationProgress(for: requestedIdentifier)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                isPreparing = false
+                cancelProgressObservation()
+            }
+            do {
+                let resolvedLocale = try await assetManager.prepare(locale: requestedLocale)
+                guard requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                    return
+                }
+                let identifier = LanguageUtil.localeIdentifier(for: resolvedLocale)
+                if identifier.caseInsensitiveCompare(selectedLocaleIdentifier) != .orderedSame {
+                    selectedLocaleIdentifier = identifier
+                }
+                AppPreferences.shared.localeIdentifier = identifier
+                status = await assetManager.status(for: resolvedLocale)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                    return
+                }
+                errorMessage = error.localizedDescription
+                status = AppleSpeechAssetStatus(
+                    locale: requestedLocale,
+                    state: .failed,
+                    progress: 0,
+                    errorMessage: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func observePreparationProgress(for requestedIdentifier: String) {
+        let assetManager = self.assetManager
+        progressTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                if let self {
+                    guard self.isPreparing,
+                          requestedIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
+                        return
+                    }
+
+                    if let currentStatus = assetManager.currentStatus,
+                       requestedIdentifier.caseInsensitiveCompare(
+                           LanguageUtil.localeIdentifier(for: currentStatus.locale)
+                       ) == .orderedSame {
+                        self.status = currentStatus
+                    }
+                } else {
+                    return
+                }
+
+                do {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func cancelProgressObservation() {
+        progressTask?.cancel()
+        progressTask = nil
     }
 }
 
 struct OnboardingView: View {
     @StateObject private var viewModel = OnboardingViewModel()
     @EnvironmentObject private var appState: AppState
-    @State private var showError = false
-    @State private var errorMessage = ""
 
     var body: some View {
-        ZStack {
-            VStack(alignment: .leading) {
-                Text("Welcome to OpenSuperWhisper!")
-                    .font(.title)
-                    .padding()
-
-                // Language selection
-                VStack(alignment: .leading) {
-                    Text("Choose speech language")
-                        .font(.headline)
-                    Picker("", selection: $viewModel.selectedLanguage) {
-                        ForEach(LanguageUtil.availableLanguages, id: \.self) { code in
-                            Text(LanguageUtil.languageNames[code] ?? code)
-                                .tag(code)
-                        }
-                    }
-                    .frame(width: 200)
-                }
-                .padding()
-
-                VStack(alignment: .leading) {
-                    Text("Choose Model")
-                        .font(.headline)
-
-                    Text("The model is designed to transcribe audio into text. It is a powerful tool that can be used to transcribe audio into text.")
-                        .font(.subheadline)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 8)
-                }
-                .padding()
-
-                ModelListView(viewModel: viewModel)
-
-                HStack {
-                    Spacer()
-                    Button(action: {
-                        handleNextButtonTap()
-                    }) {
-                        Text("Next")
-                    }
-                    .padding()
-                    .disabled(viewModel.selectedModel == nil || viewModel.isDownloadingAny)
-                }
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("A private voice, ready when you are.")
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                Text("OpenSuperWhisper uses Apple Speech on your Mac so your words can stay on-device.")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding()
-            .frame(width: 450, height: 650)
-            .alert("Download Error", isPresented: $showError) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(errorMessage)
-            }
-        }
-    }
+            .padding(.bottom, 24)
 
-    private func handleNextButtonTap() {
-        guard let selectedModel = viewModel.selectedModel else { return }
-
-        if selectedModel.isDownloaded {
-            // If model is already downloaded, proceed immediately
-            appState.hasCompletedOnboarding = true
-        } else {
-            // If model needs to be downloaded, start download
-            Task {
-                do {
-                    try await viewModel.downloadSelectedModel()
-                    // After successful download, proceed to the main app
-                    await MainActor.run {
-                        appState.hasCompletedOnboarding = true
-                    }
-                } catch {
-                    await MainActor.run {
-                        errorMessage = error.localizedDescription
-                        showError = true
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Choose your speech language")
+                    .font(.headline)
+                Picker("Speech language", selection: $viewModel.selectedLocaleIdentifier) {
+                    ForEach(viewModel.availableLocaleIdentifiers, id: \.self) { identifier in
+                        Text(LanguageUtil.displayName(for: identifier))
+                            .tag(identifier)
                     }
                 }
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("Speech language")
+                Text("Apple Speech will use the closest supported regional voice for this locale.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-        }
-    }
-}
+            .padding(16)
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
 
-struct DownloadableModel: Identifiable {
-    let id = UUID() // Add an ID for Identifiable conformance
-    let name: String
-    var isDownloaded: Bool
-    let url: URL
-    let size: Int
-    var speedRate: Int
-    var accuracyRate: Int
-    var downloadProgress: Double = 0.0 // 0 to 1
-
-    var sizeString: String {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useMB, .useGB] // More appropriate units
-        formatter.countStyle = .file
-        formatter.includesUnit = true
-        formatter.isAdaptive = true // Let the formatter decide
-        return formatter.string(fromByteCount: Int64(size) * 1000000) // Convert to MB as your size is in MB
-    }
-
-    init(name: String, isDownloaded: Bool, url: URL, size: Int, speedRate: Int, accuracyRate: Int) {
-        self.name = name
-        self.isDownloaded = isDownloaded
-        self.url = url
-        self.size = size
-        self.speedRate = speedRate
-        self.accuracyRate = accuracyRate
-    }
-}
-
-let availableModels = [
-
-    DownloadableModel(
-        name: "Turbo V3 large",
-        isDownloaded: false,
-        url: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin?download=true")!,
-        size: 1624,
-        speedRate: 60,
-        accuracyRate: 100
-    ),
-    DownloadableModel(
-        name: "Turbo V3 medium",
-        isDownloaded: false,
-        url: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin?download=true")!,
-        size: 874,
-        speedRate: 70,
-        accuracyRate: 70
-    ),
-    DownloadableModel(
-        name: "Turbo V3 small",
-        isDownloaded: false,
-        url: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin?download=true")!,
-        size: 574,
-        speedRate: 100,
-        accuracyRate: 60
-    )
-]
-
-// UI for the model
-struct DownloadableItemView: View {
-    @Binding var model: DownloadableModel
-    @EnvironmentObject var viewModel: OnboardingViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .center, spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 12) {
-                        Text(model.name)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Image(systemName: statusSymbol)
+                        .foregroundStyle(statusColor)
+                        .frame(width: 20)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(statusTitle)
                             .font(.headline)
-
-                        Spacer()
-
-                        VStack {
-                            Text("Accuracy")
-                            ProgressView(value: Double(model.accuracyRate), total: 100)
-                                .progressViewStyle(LinearProgressViewStyle())
-                                .frame(width: 64, height: 4)
-                        }
-
-                        VStack {
-                            Text("Speed")
-                            ProgressView(value: Double(model.speedRate), total: 100)
-                                .progressViewStyle(LinearProgressViewStyle())
-                                .frame(width: 64, height: 4)
-                        }
-                    }
-
-                    Text(model.sizeString)
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-
-                    if model.name == "Turbo V3 large" {
-                        Text("Recommended!")
+                        Text(statusSubtitle)
                             .font(.caption)
-                            .foregroundColor(.green)
-                            .padding(.top, 2)
+                            .foregroundStyle(.secondary)
                     }
+                    Spacer()
                 }
 
-                Spacer()
+                if let status = viewModel.status, status.state == .downloading {
+                    ProgressView(value: status.progress)
+                        .progressViewStyle(.linear)
+                }
 
-                // Download status indicator
-                if model.isDownloaded {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.green)
-                } else if model.downloadProgress > 0 && model.downloadProgress < 1 {
-                    VStack(spacing: 4) {
-                        ProgressView(value: model.downloadProgress)
-                            .progressViewStyle(CircularProgressViewStyle())
-                            .frame(width: 30, height: 30)
-                    }
-                } else {
-                    Image(systemName: "arrow.down.circle")
-                        .foregroundColor(.gray)
-                        .imageScale(.large)
+                if let error = viewModel.errorMessage {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
             .padding(16)
-        }
-        .frame(width: 400)
-        .padding(.vertical, 8)
-        .background(model.name == viewModel.selectedModel?.name ? Color.gray.opacity(0.3) : Color.clear)
-        .cornerRadius(16)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            viewModel.selectedModel = model
-        }
-    }
-}
+            .background(Color(nsColor: .controlBackgroundColor).opacity(0.45))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .padding(.top, 14)
 
-struct ModelListView: View {
-    @ObservedObject var viewModel: OnboardingViewModel
+            Spacer(minLength: 20)
 
-    var body: some View {
-        VStack {
-            ForEach($viewModel.models) { $model in
-                DownloadableItemView(model: $model)
-                    .environmentObject(viewModel)
+            HStack {
+                Text("You can change this later in Settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(buttonTitle) {
+                    if viewModel.isReady {
+                        appState.hasCompletedOnboarding = true
+                    } else {
+                        viewModel.prepareAsset()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(viewModel.isPreparing || isUnavailable)
             }
         }
-        .listStyle(.bordered)
+        .padding(28)
+        .frame(width: 450, height: 650)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear { viewModel.refresh() }
+    }
+
+    private var statusSymbol: String {
+        switch viewModel.status?.state {
+        case .installed: return "checkmark.circle.fill"
+        case .downloading: return "arrow.down.circle"
+        case .failed: return "exclamationmark.triangle.fill"
+        case .unsupported: return "nosign"
+        case .supported, .none: return "icloud.and.arrow.down"
+        }
+    }
+
+    private var statusColor: Color {
+        switch viewModel.status?.state {
+        case .installed: return .green
+        case .downloading: return .accentColor
+        case .failed, .unsupported: return .red
+        case .supported, .none: return .secondary
+        }
+    }
+
+    private var statusTitle: String {
+        switch viewModel.status?.state {
+        case .installed: return "Apple Speech is ready"
+        case .downloading: return "Preparing \(viewModel.selectedLocaleDisplayName)…"
+        case .failed: return "Could not prepare the language"
+        case .unsupported: return "This locale is unavailable"
+        case .supported: return "Ready to prepare Apple Speech"
+        case .none: return "Checking Apple Speech availability…"
+        }
+    }
+
+    private var statusSubtitle: String {
+        switch viewModel.status?.state {
+        case .installed: return "Your first dictation will work offline."
+        case .downloading: return "This may take a moment; keep this window open."
+        case .failed: return "Check your connection, then try again."
+        case .unsupported: return "Choose another supported language."
+        case .supported: return "Download the on-device language asset to continue."
+        case .none: return "Checking the languages installed on this Mac."
+        }
+    }
+
+    private var buttonTitle: String {
+        if viewModel.isReady { return "Start dictating" }
+        if viewModel.status?.state == .failed { return "Retry" }
+        return "Prepare Apple Speech"
+    }
+
+    private var isUnavailable: Bool {
+        viewModel.status?.state == .unsupported
     }
 }
 
 #Preview {
     OnboardingView()
-}
-
-#Preview {
-    ModelListView(viewModel: OnboardingViewModel())
+        .environmentObject(AppState())
 }

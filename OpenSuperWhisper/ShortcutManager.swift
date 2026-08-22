@@ -31,6 +31,14 @@ class ShortcutManager {
             // Perform UI actions on the main actor
             Task { @MainActor in
                 if self.activeVm == nil {
+                    // FileDropHandler claims a drop before the shared
+                    // controller starts, so guard both ownership markers
+                    // before creating an indicator. This prevents a shortcut
+                    // press from later canceling work it did not start. The
+                    // checks and claim below are serialized on the main actor.
+                    guard !FileDropHandler.shared.isTranscribing,
+                          !DictationSessionController.shared.state.isBusy else { return }
+
                     // First press: show indicator and start recording immediately
                     let cursorPosition = FocusUtils.getCurrentCursorPosition()
                     let indicatorPoint: NSPoint?
@@ -41,12 +49,18 @@ class ShortcutManager {
                         indicatorPoint = cursorPosition
                     }
                     let vm = IndicatorWindowManager.shared.show(nearPoint: indicatorPoint)
-                    vm.startRecording()
+                    // Keep the operation identity installed before starting
+                    // the controller. A preparation failure can transition
+                    // to a terminal state synchronously, and the delegate
+                    // callback must be able to clear this same VM.
                     self.activeVm = vm
+                    vm.startRecording()
                 } else if !self.holdMode {
                     // Second quick press: toggle off recording
                     IndicatorWindowManager.shared.stopRecording()
-                    self.activeVm = nil
+                    // Keep activeVm until indicatorDidFinish. The controller
+                    // may still be finalizing, transcribing, or uploading;
+                    // Escape must remain able to cancel that work.
                 }
             }
             // Schedule hold-mode flag after threshold
@@ -67,7 +81,6 @@ class ShortcutManager {
                 if self.holdMode {
                     // End hold-to-record
                     IndicatorWindowManager.shared.stopRecording()
-                    self.activeVm = nil
                     self.holdMode = false
                 }
                 // Tap-mode toggle off handled on keyDown
@@ -79,11 +92,19 @@ class ShortcutManager {
             Task { @MainActor in
                 if self.activeVm != nil {
                     IndicatorWindowManager.shared.stopForce()
-                    self.activeVm = nil
                 }
             }
         }
         KeyboardShortcuts.disable(.escape)
+    }
+
+    @MainActor
+    func indicatorDidFinish(_ viewModel: IndicatorViewModel) {
+        guard activeVm === viewModel else { return }
+        holdWorkItem?.cancel()
+        holdWorkItem = nil
+        holdMode = false
+        activeVm = nil
     }
 
 }

@@ -12,30 +12,37 @@ class FileDropHandler: ObservableObject {
     @Published var fileDuration: TimeInterval = 0
     @Published var errorMessage: String? = nil
     
-    // Store references to services at initialization time
-    private let transcriptionService: TranscriptionService
-    private let recordingStore: RecordingStore
-    
+    private let sessionController: DictationSessionController
+    private var activeDropOperationID: UUID?
+    private var intentionallyCancelledDropOperationIDs = Set<UUID>()
+    private var errorMessageToken: UUID?
+    private let durationLoader: (URL) async throws -> TimeInterval
+
     var isLongFile: Bool {
         fileDuration > 10.0
     }
-    
-    private init() {
-        self.transcriptionService = TranscriptionService.shared
-        self.recordingStore = RecordingStore.shared
+
+    init(
+        sessionController: DictationSessionController? = nil,
+        durationLoader: @escaping (URL) async throws -> TimeInterval = { url in
+            let asset = AVURLAsset(url: url)
+            let duration = try await asset.load(.duration)
+            return CMTimeGetSeconds(duration)
+        }
+    ) {
+        self.sessionController = sessionController ?? .shared
+        self.durationLoader = durationLoader
     }
     
     func showProcessingError() {
-        errorMessage = "Already processing a file. Please wait."
-        
-        // Clear error message after 3 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            self?.errorMessage = nil
-        }
+        presentTransientError("Already processing a file. Please wait.", duration: 3)
     }
     
     func cancelTranscription() {
-        transcriptionService.cancelTranscription()
+        if let operationID = activeDropOperationID {
+            intentionallyCancelledDropOperationIDs.insert(operationID)
+        }
+        sessionController.cancelRecording()
         
         // Reset state
         isTranscribing = false
@@ -46,130 +53,137 @@ class FileDropHandler: ObservableObject {
         guard let provider = providers.first else { return }
 
         // Double-check we're not already processing
-        if isTranscribing {
+        if isTranscribing || sessionController.state.isBusy {
             showProcessingError()
             return
         }
 
-        if provider.hasItemConformingToTypeIdentifier(UTType.audio.identifier) {
-            do {
-                // Create a continuation to handle the non-Sendable NSItemProvider
-                let url = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL?, Error>) in
-                    provider.loadItem(forTypeIdentifier: UTType.audio.identifier) { item, error in
-                        if let error = error {
-                            continuation.resume(throwing: error)
-                            return
-                        }
-                        continuation.resume(returning: item as? URL)
+        guard provider.hasItemConformingToTypeIdentifier(UTType.audio.identifier) else {
+            return
+        }
+
+        // Keep this identity alive until every suspended part of the drop has
+        // returned. Cancellation resets the visible state immediately, so a
+        // boolean alone cannot tell a late cancellation from a newer drop.
+        if let activeDropOperationID,
+           !intentionallyCancelledDropOperationIDs.contains(activeDropOperationID) {
+            showProcessingError()
+            return
+        }
+        let operationID = UUID()
+        activeDropOperationID = operationID
+        isTranscribing = true
+        defer { finishDropOperation(operationID) }
+
+        do {
+            // Create a continuation to handle the non-Sendable NSItemProvider
+            let url = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL?, Error>) in
+                provider.loadItem(forTypeIdentifier: UTType.audio.identifier) { item, error in
+                    if let error = error {
+                        continuation.resume(throwing: error)
+                        return
                     }
+                    continuation.resume(returning: item as? URL)
                 }
-
-                guard let url = url else {
-                    print("Error loading item: not a URL")
-                    return
-                }
-
-                let needsAccess = url.startAccessingSecurityScopedResource()
-                defer {
-                    if needsAccess {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-                }
-
-                print("url: \(url)")
-
-                // Get audio duration
-                let asset = AVAsset(url: url)
-                let duration = try await asset.load(.duration)
-                let durationInSeconds = CMTimeGetSeconds(duration)
-                
-                self.fileDuration = durationInSeconds
-                self.isTranscribing = true
-                
-                print("start decoding...")
-                let text = try await transcriptionService.transcribeAudio(
-                    url: url, settings: Settings()
-                )
-                
-                // Create a new Recording instance
-                let timestamp = Date()
-                let fileName = "\(Int(timestamp.timeIntervalSince1970)).wav"
-                let finalURL = Recording(
-                    id: UUID(),
-                    timestamp: timestamp,
-                    fileName: fileName,
-                    transcription: text,
-                    duration: fileDuration
-                ).url
-
-                // Copy the file for playback
-                let directory = finalURL.deletingLastPathComponent()
-                if !FileManager.default.fileExists(atPath: directory.path) {
-                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                }
-
-                if FileManager.default.fileExists(atPath: finalURL.path) {
-                    try FileManager.default.removeItem(at: finalURL)
-                }
-
-                try FileManager.default.copyItem(at: url, to: finalURL)
-
-                // Save the recording to store
-                self.recordingStore.addRecording(
-                    Recording(
-                        id: UUID(),
-                        timestamp: timestamp,
-                        fileName: fileName,
-                        transcription: text,
-                        duration: self.fileDuration
-                    ))
-                
-            } catch {
-                Task { @MainActor in
-                    self.present(error: error)
-                }
-                print("Error processing dropped audio file: \(error)")
             }
 
-            self.isTranscribing = false
-            self.fileDuration = 0
+            guard let url = url else {
+                print("Error loading item: not a URL")
+                return
+            }
+
+            guard isDropOperationActive(operationID) else { return }
+
+            let needsAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if needsAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            print("url: \(url)")
+
+            // Get audio duration
+            let durationInSeconds = try await durationLoader(url)
+
+            guard isDropOperationActive(operationID) else { return }
+
+            self.fileDuration = durationInSeconds
+
+            _ = try await sessionController.transcribeFile(
+                at: url,
+                duration: durationInSeconds
+            )
+        } catch {
+            let wasIntentionalCancellation = intentionallyCancelledDropOperationIDs.contains(operationID)
+            if !(wasIntentionalCancellation && Self.isCancellation(error)) {
+                // This method is MainActor-isolated already. Presenting here
+                // preserves the operation identity instead of scheduling a
+                // task that may run after a new drop has started.
+                present(error: error, for: operationID)
+            }
+            print("Error processing dropped audio file: \(error)")
         }
     }
 
-    private func present(error: Error) {
-        if let transcriptionError = error as? TranscriptionError {
-            switch transcriptionError {
-            case .missingAPIKey:
-                errorMessage = "OpenAI API key not found. Add one in Settings before using the OpenAI backend."
-            case let .fileTooLarge(limitMB):
-                errorMessage = "Audio file is larger than OpenAI's \(limitMB) MB limit. Please trim or compress it."
-            case let .openAIError(message):
-                errorMessage = "OpenAI transcription failed: \(message)"
-            case .contextInitializationFailed:
-                errorMessage = "Unable to load the local Whisper model. Check your model files in Settings."
-            case .audioConversionFailed:
-                errorMessage = "Failed to convert audio for transcription."
-            case .processingFailed:
-                errorMessage = "Transcription did not complete. Please try again."
-            }
-        } else {
-            errorMessage = error.localizedDescription
-        }
+    private func finishDropOperation(_ operationID: UUID) {
+        intentionallyCancelledDropOperationIDs.remove(operationID)
+        guard activeDropOperationID == operationID else { return }
+        activeDropOperationID = nil
+        isTranscribing = false
+        fileDuration = 0
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            self?.errorMessage = nil
+    private func isDropOperationActive(_ operationID: UUID) -> Bool {
+        activeDropOperationID == operationID
+            && !intentionallyCancelledDropOperationIDs.contains(operationID)
+    }
+
+    private func present(error: Error, for operationID: UUID) {
+        guard activeDropOperationID == operationID else { return }
+        presentTransientError(error.localizedDescription, duration: 5)
+    }
+
+    private func presentTransientError(_ message: String, duration: TimeInterval) {
+        let token = UUID()
+        errorMessageToken = token
+        errorMessage = message
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self, self.errorMessageToken == token else { return }
+            self.errorMessage = nil
+            self.errorMessageToken = nil
         }
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        if let error = error as? CoreTranscriptionError {
+            return error == .cancelled
+        }
+        if let error = error as? OpenAITranscriptionEngineError {
+            return error == .cancelled
+        }
+        if let error = error as? AudioCaptureError {
+            return error == .cancelled
+        }
+        if let error = error as? URLError {
+            return error.code == .cancelled
+        }
+        return false
     }
 }
 
 // View modifier for adding drag-and-drop functionality
 struct FileDropOverlay: ViewModifier {
     @ObservedObject private var handler: FileDropHandler
-    @ObservedObject private var transcriptionService: TranscriptionService
-    
+    @ObservedObject private var sessionController: DictationSessionController
+
     init() {
         self.handler = FileDropHandler.shared
-        self.transcriptionService = TranscriptionService.shared
+        self.sessionController = DictationSessionController.shared
     }
     
     func body(content: Content) -> some View {
@@ -201,7 +215,7 @@ struct FileDropOverlay: ViewModifier {
                     .ignoresSafeArea()
                 }
                 
-                // Show transcription progress for dropped files
+                // Show transcription status for dropped files
                 if handler.isTranscribing && handler.isLongFile {
                     ZStack {
                         // Add blur background effect
@@ -210,16 +224,15 @@ struct FileDropOverlay: ViewModifier {
                             .blur(radius: 10)
                         
                         VStack(spacing: 16) {
-                            ProgressView(value: transcriptionService.progress)
-                                .progressViewStyle(LinearProgressViewStyle())
+                            ProgressView()
                                 .frame(width: 200)
                             
-                            Text("Transcribing audio... \(Int(transcriptionService.progress * 100))%")
+                            Text("Transcribing audio...")
                                 .foregroundColor(.primary)
                                 .font(.headline)
                             
-                            if !transcriptionService.currentSegment.isEmpty {
-                                Text(transcriptionService.currentSegment)
+                            if !sessionController.interimText.isEmpty {
+                                Text(sessionController.interimText)
                                     .foregroundColor(.primary.opacity(0.8))
                                     .font(.subheadline)
                                     .multilineTextAlignment(.center)

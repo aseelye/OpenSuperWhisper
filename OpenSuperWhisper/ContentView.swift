@@ -6,161 +6,64 @@
 //
 
 import AVFoundation
+import Combine
 import KeyboardShortcuts
 import SwiftUI
 import UniformTypeIdentifiers
 
 @MainActor
 class ContentViewModel: ObservableObject {
-    @Published var state: RecordingState = .idle
-    @Published var isBlinking = false
-    @Published var recorder: AudioRecorder = .shared
-    @Published var transcriptionService = TranscriptionService.shared
-    @Published var recordingStore = RecordingStore.shared
-    @Published var recordingDuration: TimeInterval = 0
-    @Published var errorMessage: String?
-    @Published var isShowingError: Bool = false
+    let sessionController: DictationSessionController
+    @Published var recordingStore: RecordingStore
 
-    private var blinkTimer: Timer?
-    private var recordingStartTime: Date?
-    private var durationTimer: Timer?
+    private var controllerCancellable: AnyCancellable?
 
-    var isRecording: Bool {
-        recorder.isRecording
-    }
-    
-    func startRecording() {
-        state = .recording
-        startBlinking()
-        recordingStartTime = Date()
-        recordingDuration = 0
-        
-        // Start timer to track recording duration
-        durationTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            
-            // Capture the start time in a local variable to avoid actor isolation issues
-            let startTime = Date()
-            
-            // Update duration on the main thread
-            Task { @MainActor in
-                if let recordingStartTime = self.recordingStartTime {
-                    self.recordingDuration = startTime.timeIntervalSince(recordingStartTime)
-                }
-            }
+    init(sessionController: DictationSessionController? = nil) {
+        let resolvedController = sessionController ?? DictationSessionController.shared
+        self.sessionController = resolvedController
+        self.recordingStore = RecordingStore.shared
+        controllerCancellable = resolvedController.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
         }
-        RunLoop.current.add(durationTimer!, forMode: .common)
-        
-        recorder.startRecording()
+    }
+
+    var state: DictationSessionController.State { sessionController.state }
+    var isRecording: Bool { sessionController.state == .recording }
+    var isPreparing: Bool { sessionController.state == .preparing }
+    var isProcessing: Bool { sessionController.state.isBusy && !isRecording }
+    var recordingDuration: TimeInterval { sessionController.recordingDuration }
+    var interimText: String { sessionController.interimText }
+    var errorMessage: String? { sessionController.errorMessage }
+    var isShowingError: Bool {
+        if case .failed = sessionController.state { return true }
+        return sessionController.errorMessage != nil
+    }
+
+    func startRecording() {
+        sessionController.startRecording()
     }
 
     func startDecoding() {
-        state = .decoding
-        stopBlinking()
-        stopDurationTimer()
-
-        if let tempURL = recorder.stopRecording() {
-            Task { [weak self] in
-                guard let self = self else { return }
-
-                do {
-                    print("start decoding...")
-                    let text = try await transcriptionService.transcribeAudio(url: tempURL, settings: Settings())
-
-                    // Capture the current recording duration
-                    let duration = await MainActor.run { self.recordingDuration }
-                    
-                    // Create a new Recording instance
-                    let timestamp = Date()
-                    let fileName = "\(Int(timestamp.timeIntervalSince1970)).wav"
-                    let finalURL = Recording(
-                        id: UUID(),
-                        timestamp: timestamp,
-                        fileName: fileName,
-                        transcription: text,
-                        duration: duration // Use tracked duration
-                    ).url
-
-                    // Move the temporary recording to final location
-                    try recorder.moveTemporaryRecording(from: tempURL, to: finalURL)
-
-                    // Save the recording to store
-                    await MainActor.run {
-                        self.recordingStore.addRecording(Recording(
-                            id: UUID(),
-                            timestamp: timestamp,
-                            fileName: fileName,
-                            transcription: text,
-                            duration: self.recordingDuration // Use tracked duration
-                        ))
-                    }
-
-                    print("Transcription result: \(text)")
-                } catch let error as TranscriptionError {
-                    await MainActor.run {
-                        self.presentError(self.message(for: error))
-                    }
-                    try? FileManager.default.removeItem(at: tempURL)
-                } catch {
-                    await MainActor.run {
-                        self.presentError("Transcription failed: \(error.localizedDescription)")
-                    }
-                    try? FileManager.default.removeItem(at: tempURL)
-                }
-
-                await MainActor.run {
-                    self.state = .idle
-                    self.recordingDuration = 0
-                }
-            }
-        }
+        sessionController.stopRecording()
     }
 
-    private func presentError(_ message: String) {
-        errorMessage = message
-        isShowingError = true
+    /// Handles the main record control without ever starting a new operation
+    /// while an existing finalization or transcription is in flight.
+    func handleRecordButtonTap() {
+        switch sessionController.state {
+        case .recording:
+            startDecoding()
+        case .preparing:
+            sessionController.cancelRecording()
+        case .finalizing, .transcribing:
+            break
+        case .idle, .succeeded, .failed(_), .cancelled:
+            startRecording()
+        }
     }
 
     func dismissError() {
-        isShowingError = false
-    }
-
-    private func message(for error: TranscriptionError) -> String {
-        switch error {
-        case .missingAPIKey:
-            return "OpenAI API key not found. Add one in Settings ▸ Model before using the OpenAI backend."
-        case let .openAIError(message):
-            return "OpenAI transcription failed: \(message)"
-        case let .fileTooLarge(limitMB):
-            return "Audio file exceeds OpenAI's \(limitMB) MB limit. Try trimming or compressing it."
-        case .contextInitializationFailed:
-            return "Unable to load the local Whisper model. Check your model files in Settings ▸ Model."
-        case .audioConversionFailed:
-            return "Failed to convert audio for transcription."
-        case .processingFailed:
-            return "Transcription did not complete. Please try again."
-        }
-    }
-
-    private func stopDurationTimer() {
-        durationTimer?.invalidate()
-        durationTimer = nil
-        recordingStartTime = nil
-    }
-
-    private func startBlinking() {
-        blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.isBlinking.toggle()
-            }
-        }
-        RunLoop.current.add(blinkTimer!, forMode: .common)
-    }
-
-    private func stopBlinking() {
-        blinkTimer?.invalidate()
-        blinkTimer = nil
-        isBlinking = false
+        sessionController.dismissError()
     }
 }
 
@@ -313,13 +216,16 @@ struct ContentView: View {
                     VStack(spacing: 16) {
                         // Кнопка записи по центру
                         Button(action: {
-                            if viewModel.isRecording {
-                                viewModel.startDecoding()
-                            } else {
-                                viewModel.startRecording()
-                            }
+                            viewModel.handleRecordButtonTap()
                         }) {
-                            if viewModel.state == .decoding {
+                            if viewModel.isPreparing {
+                                MainRecordButton(isRecording: false)
+                                    .overlay {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 16, weight: .semibold))
+                                            .foregroundColor(.white)
+                                    }
+                            } else if viewModel.isProcessing {
                                 // Show progress indicator ONLY when transcribing
                                 ProgressView()
                                     .scaleEffect(1.0) // Smaller size
@@ -331,7 +237,11 @@ struct ContentView: View {
                             }
                         }
                         .buttonStyle(.plain)
-                        .disabled(viewModel.transcriptionService.isLoading)
+                        .disabled(viewModel.isProcessing && !viewModel.isPreparing)
+                        .accessibilityLabel(
+                            viewModel.isPreparing ? "Cancel preparation" : "Record"
+                        )
+                        .help(viewModel.isPreparing ? "Cancel preparation" : "Record")
                         .padding(.top, 24)
                         .padding(.bottom, 16)
                         .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isRecording)
@@ -410,15 +320,24 @@ struct ContentView: View {
             let isPermissionsGranted = permissionsManager.isMicrophonePermissionGranted
                 && permissionsManager.isAccessibilityPermissionGranted
 
-            if viewModel.transcriptionService.isLoading && isPermissionsGranted {
+            if viewModel.isProcessing && !viewModel.isPreparing && isPermissionsGranted {
                 ZStack {
                     Color.black.opacity(0.3)
                     VStack(spacing: 16) {
                         ProgressView()
                             .scaleEffect(1.5)
-                        Text("Loading Whisper Model...")
+                        Text("Preparing transcription...")
                             .foregroundColor(.white)
                             .font(.headline)
+
+                        if !viewModel.interimText.isEmpty {
+                            Text(viewModel.interimText)
+                                .foregroundColor(.white.opacity(0.9))
+                                .font(.subheadline)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(3)
+                                .frame(maxWidth: 320)
+                        }
                     }
                 }
                 .ignoresSafeArea()
@@ -520,7 +439,9 @@ struct RecordingRow: View {
     @StateObject private var audioRecorder = AudioRecorder.shared
     @StateObject private var recordingStore = RecordingStore.shared
     @State private var showTranscription = false
+    @State private var showTimingDetails = false
     @State private var isHovered = false
+    @AppStorage("showTimingDetailsInHistory") private var showTimingDetailsInHistory = false
 
     private var isPlaying: Bool {
         audioRecorder.isPlaying && audioRecorder.currentlyPlayingURL == recording.url
@@ -533,6 +454,48 @@ struct RecordingRow: View {
             )
             .padding(.horizontal, 4)
             .padding(.top, 8)
+
+            // Timing is history metadata, not transcript text.  Keep it
+            // behind an explicit detail affordance and the user's preference
+            // so timestamps never leak into copied or pasted text.
+            if showTimingDetailsInHistory && !recording.transcriptSegments.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showTimingDetails.toggle()
+                        }
+                    } label: {
+                        Label(
+                            showTimingDetails ? "Hide timing details" : "Show timing details",
+                            systemImage: showTimingDetails ? "clock.badge.xmark" : "clock"
+                        )
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+
+                    if showTimingDetails {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(recording.transcriptSegments.enumerated()), id: \.offset) { _, segment in
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(Self.timeRangeDescription(for: segment))
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundColor(.secondary)
+                                        .frame(width: 92, alignment: .leading)
+                                    Text(segment.text)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        }
+                        .padding(.leading, 8)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+            }
 
             Divider()
                 .padding(.horizontal, 12)
@@ -610,6 +573,16 @@ struct RecordingRow: View {
         }
         .padding(.vertical, 4)
         .transition(.scale.combined(with: .opacity))
+    }
+
+    private static func timeRangeDescription(for segment: TranscriptSegment) -> String {
+        func format(_ seconds: TimeInterval) -> String {
+            let safeSeconds = max(0, seconds)
+            let minutes = Int(safeSeconds) / 60
+            let remainingSeconds = safeSeconds - Double(minutes * 60)
+            return String(format: "%02d:%04.1f", minutes, remainingSeconds)
+        }
+        return "\(format(segment.startTime)) – \(format(segment.endTime))"
     }
 }
 

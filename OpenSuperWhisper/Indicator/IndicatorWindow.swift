@@ -1,109 +1,71 @@
 import Cocoa
+import Combine
 import SwiftUI
-
-enum RecordingState {
-    case idle
-    case recording
-    case decoding
-}
 
 @MainActor
 protocol IndicatorViewDelegate: AnyObject {
-    
-    func didFinishDecoding()
+    func didFinishDecoding(_ viewModel: IndicatorViewModel)
 }
 
 @MainActor
 class IndicatorViewModel: ObservableObject {
-    @Published var state: RecordingState = .idle
+    let sessionController: DictationSessionController
     @Published var isBlinking = false
-    @Published var recorder: AudioRecorder = .shared
     @Published var isVisible = false
-    
+
     var delegate: IndicatorViewDelegate?
     private var blinkTimer: Timer?
-    
-    // Get a reference to the RecordingStore at initialization time
-    private let recordingStore: RecordingStore
-    
-    init() {
-        self.recordingStore = RecordingStore.shared
-    }
-    
-    func startRecording() {
-        state = .recording
-        startBlinking()
-        recorder.startRecording()
-    }
-    
-    func startDecoding() {
-        state = .decoding
-        stopBlinking()
-        
-        if let tempURL = recorder.stopRecording() {
-            // Get a reference to the transcription service
-            let transcription = TranscriptionService.shared
-            
-            Task { [weak self] in
-                guard let self = self else { return }
-                
-                do {
-                    print("start decoding...")
-                    let text = try await transcription.transcribeAudio(url: tempURL, settings: Settings())
-                    
-                    // Create a new Recording instance
-                    let timestamp = Date()
-                    let fileName = "\(Int(timestamp.timeIntervalSince1970)).wav"
-                    let finalURL = Recording(
-                        id: UUID(),
-                        timestamp: timestamp,
-                        fileName: fileName,
-                        transcription: text,
-                        duration: 0 // TODO: Get actual duration
-                    ).url
-                    
-                    // Move the temporary recording to final location
-                    try recorder.moveTemporaryRecording(from: tempURL, to: finalURL)
-                    
-                    // Save the recording to store
-                    await MainActor.run {
-                        self.recordingStore.addRecording(Recording(
-                            id: UUID(),
-                            timestamp: timestamp,
-                            fileName: fileName,
-                            transcription: text,
-                            duration: 0 // TODO: Get actual duration
-                        ))
-                    }
-                    
-                    insertTextUsingPasteboard(text)
-                    print("Transcription result: \(text)")
-                } catch {
-                    print("Error transcribing audio: \(error)")
-                    try? FileManager.default.removeItem(at: tempURL)
-                }
-                
-                await MainActor.run {
-                    self.delegate?.didFinishDecoding()
-                }
-            }
-        } else {
-            
-            print("!!! Not found record url !!!")
-            
-            Task {
-                await MainActor.run {
-                    self.delegate?.didFinishDecoding()
-                }
-            }
+    private var controllerCancellable: AnyCancellable?
+    private var stateCancellable: AnyCancellable?
+
+    init(sessionController: DictationSessionController? = nil) {
+        let resolvedController = sessionController ?? DictationSessionController.shared
+        self.sessionController = resolvedController
+        controllerCancellable = resolvedController.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
         }
+        stateCancellable = resolvedController.$state
+            .removeDuplicates()
+            .sink { [weak self] state in
+                guard let self else { return }
+                self.updateBlinking(for: state)
+                switch state {
+                case .succeeded, .failed, .cancelled:
+                    self.delegate?.didFinishDecoding(self)
+                case .idle, .preparing, .recording, .finalizing, .transcribing:
+                    break
+                }
+            }
     }
-    
+
+    var state: DictationSessionController.State {
+        sessionController.state
+    }
+
+    var interimText: String {
+        sessionController.interimText
+    }
+
+    var progress: Double {
+        sessionController.progress
+    }
+
+    func startRecording() {
+        sessionController.startRecording(pasteOnCompletion: true)
+        startBlinking()
+    }
+
+    func startDecoding() {
+        sessionController.stopRecording()
+        stopBlinking()
+    }
+
     func insertTextUsingPasteboard(_ text: String) {
         ClipboardUtil.insertTextUsingPasteboard(text)
     }
     
     private func startBlinking() {
+        blinkTimer?.invalidate()
         blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
             // Update UI on the main thread
             Task { @MainActor in
@@ -120,7 +82,16 @@ class IndicatorViewModel: ObservableObject {
     }
 
     func cancelRecording() {
-        recorder.cancelRecording()
+        sessionController.cancelRecording()
+        stopBlinking()
+    }
+
+    private func updateBlinking(for state: DictationSessionController.State) {
+        if state == .recording {
+            startBlinking()
+        } else {
+            stopBlinking()
+        }
     }
 
     @MainActor
@@ -171,35 +142,62 @@ struct IndicatorWindow: View {
 
         let rect = RoundedRectangle(cornerRadius: 24)
         
-        VStack(spacing: 12) {
+        VStack(spacing: 8) {
             switch viewModel.state {
             case .recording:
                 HStack(spacing: 8) {
                     RecordingIndicator(isBlinking: viewModel.isBlinking)
                         .frame(width: 24)
                     
-                    Text("Recording...")
-                        .font(.system(size: 13, weight: .semibold))
+                    if viewModel.interimText.isEmpty {
+                        Text("Recording...")
+                            .font(.system(size: 13, weight: .semibold))
+                    } else {
+                        Text(viewModel.interimText)
+                            .font(.system(size: 13))
+                            .lineLimit(3)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 
-            case .decoding:
+            case .finalizing, .transcribing:
                 HStack(spacing: 8) {
                     ProgressView()
                         .scaleEffect(0.7)
                         .frame(width: 24)
-                    
-                    Text("Transcribing...")
+
+                    Text(viewModel.interimText.isEmpty ? "Transcribing..." : viewModel.interimText)
+                        .font(.system(size: 13))
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            case .succeeded:
+                Text(viewModel.interimText)
+                    .font(.system(size: 13))
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+            case .preparing:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                        .frame(width: 24)
+                    Text("Preparing…")
                         .font(.system(size: 13, weight: .semibold))
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                
-            case .idle:
+
+            case .idle, .failed(_), .cancelled:
                 EmptyView()
             }
         }
         .padding(.horizontal, 24)
-        .frame(height: 36)
+        .padding(.vertical, 8)
+        .frame(minHeight: 36)
         .background {
             rect
                 .fill(backgroundColor)
@@ -210,7 +208,7 @@ struct IndicatorWindow: View {
                 .shadow(color: .black.opacity(0.15), radius: 10, x: 0, y: 4)
         }
         .clipShape(rect)
-        .frame(width: 200)
+        .frame(width: viewModel.interimText.isEmpty ? 200 : 340)
         .scaleEffect(viewModel.isVisible ? 1 : 0.5)
         .offset(y: viewModel.isVisible ? 0 : 20)
         .opacity(viewModel.isVisible ? 1 : 0)

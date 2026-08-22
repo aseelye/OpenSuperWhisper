@@ -11,15 +11,8 @@ KEYCHAIN_PROFILE="Slava"
 CODE_SIGN_IDENTITY="${1}"
 DEVELOPMENT_TEAM="8LLDD7HWZK"
 
-rm -rf libwhisper/build
-cmake -G Xcode -B libwhisper/build -S libwhisper -DWHISPER_ALL_WARNINGS=OFF -DGGML_ALL_WARNINGS=OFF
-
 rm -rf build
 mkdir -p build
-
-echo "Building autocorrect-swift..."
-cargo build -p autocorrect-swift --release --target aarch64-apple-darwin --manifest-path=asian-autocorrect/Cargo.toml
-mv ./asian-autocorrect/target/aarch64-apple-darwin/release/libautocorrect_swift.dylib ./build/libautocorrect_swift.dylib
 
 xcodebuild \
   -scheme "OpenSuperWhisper" \
@@ -30,6 +23,7 @@ xcodebuild \
   CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY}" \
   OTHER_CODE_SIGN_FLAGS=--timestamp \
   CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+  MACOSX_DEPLOYMENT_TARGET=26.0 \
   -derivedDataPath build \
   build | xcpretty --simple --color
 

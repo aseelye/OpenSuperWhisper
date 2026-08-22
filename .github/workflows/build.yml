@@ -8,23 +8,15 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Checkout repository (with submodules)
+      - name: Checkout repository
         uses: actions/checkout@v5
-        with:
-          submodules: recursive
       - name: Set up Ruby (for xcpretty)
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
       - name: Install xcpretty
         run: gem install xcpretty
-      - name: Set up CMake
-        uses: jwlawson/actions-setup-cmake@v2
       - name: Make run.sh executable
         run: chmod +x ./run.sh
-      - name: Prepare cache directories
-        run: |
-          mkdir -p "$HOME/.cache/clang/ModuleCache"
-          mkdir -p "$HOME/Library/Caches/org.swift.swiftpm/manifests/ManifestLoading"
       - name: Build with run.sh
-        run: ./run.sh build 
+        run: ./run.sh build

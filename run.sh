@@ -7,23 +7,6 @@ fi
 
 set -o pipefail
 
-# Configure libwhisper
-echo "Configuring libwhisper..."
-cmake -G Xcode -B libwhisper/build -S libwhisper -DWHISPER_ALL_WARNINGS=OFF -DGGML_ALL_WARNINGS=OFF
-if [[ $? -ne 0 ]]; then
-    echo "CMake configuration failed!"
-    exit 1
-fi
-
-echo "Building autocorrect-swift..."
-mkdir -p build
-cargo build -p autocorrect-swift --release --target aarch64-apple-darwin --manifest-path=asian-autocorrect/Cargo.toml
-mv ./asian-autocorrect/target/aarch64-apple-darwin/release/libautocorrect_swift.dylib ./build/libautocorrect_swift.dylib
-if [[ $? -ne 0 ]]; then
-    echo "Cargo build failed!"
-    exit 1
-fi
-
 # Build the app
 echo "Building OpenSuperWhisper..."
 mkdir -p build/ModuleCache build/SwiftPackageCache build/logs
@@ -36,7 +19,7 @@ export SWIFT_PACKAGE_CACHE_PATH="$SWIFTPM_PACKAGE_CACHE"
 mkdir -p "$HOME/.cache/clang/ModuleCache" "$HOME/Library/Caches/org.swift.swiftpm/manifests/ManifestLoading" 2>/dev/null || true
 
 XCODE_LOG="$PWD/build/logs/xcodebuild.log"
-CMD=(xcodebuild -scheme OpenSuperWhisper -configuration Debug -jobs 8 -derivedDataPath build -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation -UseModernBuildSystem=YES -clonedSourcePackagesDirPath SourcePackages -skipUnavailableActions CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO OTHER_CODE_SIGN_FLAGS="--entitlements OpenSuperWhisper/OpenSuperWhisper.entitlements" build)
+CMD=(xcodebuild -scheme OpenSuperWhisper -configuration Debug -jobs 8 -derivedDataPath build -destination 'platform=macOS,arch=arm64' -skipPackagePluginValidation -skipMacroValidation -skipUnavailableActions CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO MACOSX_DEPLOYMENT_TARGET=26.0 build)
 
 if command -v xcpretty &> /dev/null; then
     "${CMD[@]}" 2>&1 | tee "$XCODE_LOG" | xcpretty --simple --color

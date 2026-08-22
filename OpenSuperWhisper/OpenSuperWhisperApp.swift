@@ -37,7 +37,19 @@ struct OpenSuperWhisperApp: App {
 
     init() {
         _ = ShortcutManager.shared
-        WhisperModelManager.shared.ensureDefaultModelPresent()
+
+        // Existing installs keep their completed-onboarding state. Once the
+        // preference migration has selected Apple Speech, warm its locale
+        // asset in the background so the first dictation is ready without
+        // showing onboarding again. The manager owns reservations and is
+        // idempotent for an already-installed locale.
+        let preferences = AppPreferences.shared
+        if preferences.hasCompletedOnboarding,
+           preferences.transcriptionBackend == .appleSpeech {
+            Task { @MainActor in
+                _ = try? await AppleSpeechAssetManager.shared.prepare(locale: preferences.locale)
+            }
+        }
     }
 }
 

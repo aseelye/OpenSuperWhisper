@@ -29,6 +29,8 @@ xcuserdata/
 *.ipa
 *.dSYM.zip
 *.dSYM
+*.log
+build_clean.log
 
 # macOS
 .DS_Store
@@ -125,5 +127,6 @@ OpenSuperWhisper.dmg.sha256
 
 # my codex resume session
 resume.codex.txt
+260822a-tmp/
 *~
 DEADJOE

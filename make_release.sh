@@ -121,7 +121,7 @@ if [[ -n "$GITHUB_TOKEN" ]]; then
             "tag_name": "'${NEW_VERSION}'",
             "target_commitish": "master",
             "name": "Release '${NEW_VERSION}'",
-            "body": "## OpenSuperWhisper '${NEW_VERSION}'\n\nReal-time audio transcription for macOS using Whisper.\n\n## Installation\n\n### Homebrew (Recommended)\n```bash\nbrew update\nbrew install opensuperwhisper\n```\n\n### Manual Installation\n1. Download the `OpenSuperWhisper.dmg` file below\n2. Open the DMG and drag OpenSuperWhisper to Applications\n3. Launch the app and grant necessary permissions\n\n## Requirements\n- macOS 14.0 (Sonoma) or later\n- Apple Silicon (ARM64) Mac",
+            "body": "## OpenSuperWhisper '${NEW_VERSION}'\n\nPrivate, on-device transcription with Apple's Speech framework, plus optional post-recording uploads through OpenAI's gpt-transcribe model.\n\n## Installation\n\n### Homebrew (Recommended)\n```bash\nbrew update\nbrew install opensuperwhisper\n```\n\n### Manual Installation\n1. Download the `OpenSuperWhisper.dmg` file below\n2. Open the DMG and drag OpenSuperWhisper to Applications\n3. Launch the app and grant necessary permissions\n\n## Requirements\n- macOS 26 or later\n- Apple Silicon (ARM64) Mac",
             "draft": false,
             "prerelease": false,
             "generate_release_notes": false
@@ -219,10 +219,10 @@ cask "opensuperwhisper" do
 
   url "https://github.com/starmel/OpenSuperWhisper/releases/download/#{version}/OpenSuperWhisper.dmg"
   name "OpenSuperWhisper"
-  desc "Whisper dictation/transcription app"
+  desc "Private Apple Speech and optional gpt-transcribe dictation app"
   homepage "https://github.com/starmel/OpenSuperWhisper"
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: ">= :tahoe"
   depends_on arch: :arm64
 
   app "OpenSuperWhisper.app"
@@ -233,4 +233,4 @@ cask "opensuperwhisper" do
   ]
 end
 EOF
-echo "-----" 
+echo "-----"

@@ -5,9 +5,11 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon.icns</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>14.0</string>
+	<string>26.0</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>OpenSuperWhisper needs microphone access to record audio for transcription.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>OpenSuperWhisper uses on-device speech recognition to transcribe your recordings.</string>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>OpenSuperWhisper needs accessibility access to provide system-wide functionality.</string>
 	<key>NSAppleEventsUsageDescription</key>

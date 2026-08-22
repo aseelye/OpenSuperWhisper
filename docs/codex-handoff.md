@@ -1,36 +1,43 @@
-# Codex Handoff – 2025-10-04
+# Codex Handoff – Current Architecture
 
 ## TL;DR
-- OpenAI backend now supports chunked uploads for files that exceed the 25 MB limit; stitching logic lives in `OpenSuperWhisper/TranscriptionService.swift`.
-- Timeout windows increased (req 5 min / resource 10 min) but long uploads are still timing out; chunked path needs end-to-end validation.
-- User is currently testing a large MP3 via drag-and-drop; be ready to pick up debugging that flow.
-- OpenAI uploads now retry transient failures (configurable 0–5 attempts; default 1) with exponential backoff.
+
+- `DictationSessionController` owns capture, progressive updates, cancellation,
+  finalization, and persistence for both transcription providers.
+- Apple Speech is the default on-device provider and streams progressive
+  results while recording after its macOS language asset is available.
+- OpenAI uses completed-file uploads to `gpt-transcribe`, with chunking for
+  large recordings and retry/backoff for transient failures.
+- The repository builds through the normal Xcode/SwiftPM workflow; there are
+  no native transcription submodules, bundled model files, or model-build
+  steps.
 
 ## Current State
-- `transcribeWithOpenAIChunks` (≈L381) chooses a chunk duration based on bitrate estimate and ensures each exported `.m4a` stays under ~25 MB.
-- Each chunk is exported to a temp dir (`~/Library/Caches/.../osw-openai-chunks`) and sequentially uploaded with the same request code path used for small files.
-- UI now surfaces `fileTooLarge` errors in `FileDropHandler.present(error:)`, so oversized drops warn the user before hitting the network.
-- Progress log (`docs/openai-integration-progress.log`) is up to date through the chunking implementation.
-- Retry count preference lives in Settings → Model (OpenAI section) and persists via `AppPreferences.openAIRetryCount`.
 
-## What’s Being Tested
-1. Backend: OpenAI (toggle in Settings) with a valid API key stored in the Keychain helper.
-2. Scenario: drag-and-drop MP3s >25 MB (or >6 min) to trigger chunking fallback.
-3. Environment: built/running in Xcode on macOS (app bundle at `~/Library/Developer/Xcode/DerivedData/.../Debug/OpenSuperWhisper.app`).
-4. Observed behaviour so far: drop shows 10 % progress, eventually fails with `NSURLErrorDomain Code=-1001` (~timeout) even for a ~9 MB low-bitrate file after chunking enabled.
+- `OpenSuperWhisper/TranscriptionCore.swift` defines provider-neutral
+  transcripts, updates, engine protocols, and shared errors.
+- `OpenSuperWhisper/DictationSessionController.swift` coordinates recording,
+  live sessions, completed-file transcription, cancellation, and final-only
+  history writes.
+- `OpenSuperWhisper/AudioCaptureService.swift` owns AVAudioEngine capture and
+  temporary WAV recording files.
+- `OpenSuperWhisper/AppleSpeechTranscriptionEngine.swift` uses
+  `SpeechAnalyzer`/`SpeechTranscriber` for progressive on-device results.
+- `OpenSuperWhisper/OpenAITranscriptionEngine.swift` uploads completed files,
+  keeps uploads below the 25 MB API limit, stitches chunks, and applies the
+  configured retry policy.
+- `OpenSuperWhisper/FileDropHandler.swift` routes dropped audio through the
+  same controller and surfaces provider errors to the UI.
+- `AppPreferences` migrates old provider-neutral settings and removes only
+  the known legacy model/preferences keys during upgrade.
 
-## Open Issues / Next Steps
-1. **Verify chunked transcription** – confirm `transcribeWithOpenAIChunks` actually receives OpenAI transcripts and stitches them; add logging around chunk export size/duration and HTTP response times if needed.
-2. **Investigate timeout cause** – ensure `URLSession` upload isn’t recreating large `Data` causing slow serialization; consider streaming upload or reducing `chunkDuration` (currently min 30 s, max 6 min) for slow connections. Observe whether new retry logic masks Cloudflare timeouts or if we need client-side chunk parallelism.
-3. **Temp directory cleanup** – on early failures some `osw-openai-chunks` files may persist; consider removing the directory after completion/error.
-4. **User feedback** – progress indicator jumps per chunk; optional: expose more granular progress or retry messaging for long uploads.
-5. **CI** – GitHub Actions still fails during “Building OpenSuperWhisper…” (post-Cargo step). Collect failing logs from `logs_46818487106` (if re-downloaded) and decide whether to skip the GUI build or adjust workflow.
+## Validation and follow-up
 
-## Helpful References
-- `OpenSuperWhisper/TranscriptionService.swift:381` – chunking logic.
-- `OpenSuperWhisper/TranscriptionService.swift:607` – `OpenAITranscriptionClient` with timeout configuration.
-- `OpenSuperWhisper/FileDropHandler.swift` – drag/drop orchestration + error surfacing.
-- `docs/openai-integration-progress.log` – chronological change log.
-- API limit reminder: Whisper file upload max 25 MB; streaming API not yet integrated.
+- Exercise Apple Speech with an installed language asset and verify
+  progressive updates, cancellation, and final history persistence.
+- Exercise OpenAI with a Keychain API key using both a small file and a file
+  large enough to trigger chunking; verify cleanup after success and failure.
+- GitHub Actions uses the same ordinary Xcode build invoked by `run.sh`.
 
-_Please append new findings to `docs/openai-integration-progress.log` and update this handoff file when you continue._
+Keep generated logs out of source control; update this handoff when the
+current architecture or validation status changes.

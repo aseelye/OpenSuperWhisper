@@ -23,7 +23,7 @@ class IndicatorWindowManager: IndicatorViewDelegate {
         if window == nil {
             // Create window if it doesn't exist - using NSPanel for full-screen compatibility
             let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 200, height: 60),
+                contentRect: NSRect(x: 0, y: 0, width: 340, height: 100),
                 styleMask: [.borderless, .nonactivatingPanel],
                 backing: .buffered,
                 defer: false
@@ -81,20 +81,21 @@ class IndicatorWindowManager: IndicatorViewDelegate {
         hide()
     }
 
-    func hide() {
+    func hide(_ targetViewModel: IndicatorViewModel? = nil) {
+        guard let hidingViewModel = targetViewModel ?? viewModel,
+              viewModel === hidingViewModel else { return }
         KeyboardShortcuts.disable(.escape)
-        
+
         Task {
-            guard let viewModel = self.viewModel else { return }
-            
-            await viewModel.hideWithAnimation()
-            
+            await hidingViewModel.hideWithAnimation()
+            guard self.viewModel === hidingViewModel else { return }
             self.window?.orderOut(nil)
             self.viewModel = nil
         }
     }
-    
-    func didFinishDecoding() {
-        hide()
+
+    func didFinishDecoding(_ viewModel: IndicatorViewModel) {
+        ShortcutManager.shared.indicatorDidFinish(viewModel)
+        hide(viewModel)
     }
 }
