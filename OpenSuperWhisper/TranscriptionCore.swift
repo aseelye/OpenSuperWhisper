@@ -131,42 +131,6 @@ public struct TranscriptUpdate: Codable, Equatable, Sendable {
     }
 }
 
-/// Migration compatibility for the pre-operation-handle runtime.
-///
-/// New provider work must use `TranscriptionLiveOperation` from
-/// `OperationCore.swift`.  This protocol remains temporarily so the current
-/// controller and concrete engines stay behavior-neutral and compile during
-/// the Wave 1/Wave 2 migration; it is scheduled for removal with
-/// `TranscriptionEngine` after the controller adopts the new contracts.
-public protocol LiveTranscriptionSession: AnyObject, Sendable {
-    var updates: AsyncStream<TranscriptUpdate> { get }
-
-    func append(buffer: AVAudioPCMBuffer) async throws
-    func finalize() async throws -> Transcript
-    func cancel() async
-}
-
-/// Migration compatibility for the pre-operation-handle runtime.
-///
-/// New provider work must use `TranscriptionProvider` and its synchronous
-/// operation factories from `OperationCore.swift`.  This protocol is retained
-/// only until the existing controller and concrete engines migrate in Wave 2;
-/// do not add backend-specific branches to it.
-public protocol TranscriptionEngine: Sendable {
-    func prepare(locale: Locale) async throws
-    func startSession(
-        locale: Locale,
-        context: String?,
-        expectedTerms: [String]
-    ) async throws -> any LiveTranscriptionSession
-    func transcribeFile(
-        at url: URL,
-        locale: Locale,
-        context: String?,
-        expectedTerms: [String]
-    ) async throws -> Transcript
-}
-
 /// Errors shared by capture and transcription implementations.
 public enum CoreTranscriptionError: LocalizedError, Equatable, Sendable {
     case unavailable
@@ -208,8 +172,8 @@ public enum CoreTranscriptionError: LocalizedError, Equatable, Sendable {
         }
     }
 
-    /// Compatibility spelling for callers that describe the same condition as
-    /// an audio backlog. There is still only one stored error case.
+    /// Compatibility spelling retained through the pre-1.0 migration window.
+    /// There is still only one stored error case.
     public static func audioBacklogOverflow(maximumDuration: TimeInterval) -> Self {
         .liveInputOverflow(maximumDuration: maximumDuration)
     }
@@ -248,6 +212,7 @@ public enum TranscriptionLiveInputError: LocalizedError, Equatable, Sendable {
     }
 }
 
+// Compatibility spelling retained through the pre-1.0 migration window.
 public typealias LiveAudioChannelError = TranscriptionLiveInputError
 
 /// A serial, bounded queue for copied microphone buffers.
@@ -400,8 +365,7 @@ public final class BoundedLiveAudioChannel: @unchecked Sendable {
     }
 }
 
-/// Compatibility spelling retained for clients migrating from the old live
-/// appender. It is a type alias, not a second buffering implementation.
+// Compatibility spelling retained through the pre-1.0 migration window.
 public typealias LiveAudioInputChannel = BoundedLiveAudioChannel
 
 /// Reconciles SpeechAnalyzer's range-based volatile and final results. Apple

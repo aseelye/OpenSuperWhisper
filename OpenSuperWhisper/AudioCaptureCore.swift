@@ -1,8 +1,8 @@
 @preconcurrency import AVFAudio
 import Foundation
 
-/// Configuration shared by the legacy capture service and the asynchronous
-/// capture-session boundary.
+/// Configuration shared by the AVAudioEngine implementation and the
+/// operation-scoped capture-session boundary.
 public struct AudioCaptureConfiguration: Sendable {
     public var bufferSize: AVAudioFrameCount
     public var temporaryDirectory: URL
@@ -163,8 +163,8 @@ public struct AudioCaptureDependencies: Sendable {
     }
 }
 
-// These aliases make the role of each seam discoverable without introducing
-// duplicate protocols that could drift during the Wave 2 migration.
+// Compatibility spellings remain available through the pre-1.0 migration
+// window; the driver protocols above are the canonical declarations.
 public typealias AudioCaptureEngine = AudioCaptureEngineDriver
 public typealias AudioCaptureWriter = AudioCaptureWriterDriver
 public typealias AudioCaptureCopier = AudioCaptureBufferCopier

@@ -87,7 +87,7 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
             sleep: { _ in }
         )
 
-        let transcript = try await engine.transcribeFile(
+        let transcript = try await transcribeFile(using: engine,
             at: firstURL,
             locale: Locale(identifier: "en-US"),
             context: "meeting notes",
@@ -116,7 +116,7 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
             sleep: { _ in }
         )
 
-        let transcript = try await engine.transcribeFile(
+        let transcript = try await transcribeFile(using: engine,
             at: fileURL,
             locale: Locale(identifier: "en-US"),
             context: nil,
@@ -152,13 +152,13 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
             sleep: { _ in }
         )
 
-        async let firstResult = firstEngine.transcribeFile(
+        async let firstResult = transcribeFile(using: firstEngine,
             at: firstURL,
             locale: Locale(identifier: "en-US"),
             context: nil,
             expectedTerms: []
         )
-        async let secondResult = secondEngine.transcribeFile(
+        async let secondResult = transcribeFile(using: secondEngine,
             at: secondURL,
             locale: Locale(identifier: "en-US"),
             context: nil,
@@ -188,7 +188,7 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         )
 
         do {
-            _ = try await engine.transcribeFile(
+            _ = try await transcribeFile(using: engine,
                 at: fileURL,
                 locale: Locale(identifier: "en-US"),
                 context: nil,
@@ -216,7 +216,7 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         )
 
         do {
-            _ = try await engine.transcribeFile(
+            _ = try await transcribeFile(using: engine,
                 at: fileURL,
                 locale: Locale(identifier: "en-US"),
                 context: nil,
@@ -247,7 +247,7 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
             sleep: { _ in }
         )
 
-        let transcript = try await engine.transcribeFile(
+        let transcript = try await transcribeFile(using: engine,
             at: fileURL,
             locale: Locale(identifier: "en-US"),
             context: nil,
@@ -271,7 +271,7 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         )
 
         do {
-            _ = try await engine.transcribeFile(
+            _ = try await transcribeFile(using: engine,
                 at: fileURL,
                 locale: Locale(identifier: "en-US"),
                 context: nil,
@@ -296,18 +296,19 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
             configuration: .init(endpoint: client.endpoint, retryCount: 0),
             sleep: { _ in }
         )
+        let operation = try engine.makeFileOperation(
+            at: fileURL,
+            locale: Locale(identifier: "en-US"),
+            context: nil,
+            expectedTerms: []
+        )
         let task = Task {
-            try await engine.transcribeFile(
-                at: fileURL,
-                locale: Locale(identifier: "en-US"),
-                context: nil,
-                expectedTerms: []
-            )
+            try await operation.value()
         }
 
         let requestObserved = await client.recorder.waitForRequest(timeout: 5)
         XCTAssertTrue(requestObserved, "The cancellation fixture never observed a request")
-        engine.cancel()
+        await operation.cancelAndWait()
 
         do {
             _ = try await task.value
@@ -325,6 +326,22 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
 
     private func makeClient(responses: [URLProtocolRecorder.Response]) -> TestOpenAIClient {
         TestOpenAIClient(responses: responses)
+    }
+
+    private func transcribeFile(
+        using engine: OpenAITranscriptionEngine,
+        at url: URL,
+        locale: Locale,
+        context: String?,
+        expectedTerms: [String]
+    ) async throws -> Transcript {
+        let operation = try engine.makeFileOperation(
+            at: url,
+            locale: locale,
+            context: context,
+            expectedTerms: expectedTerms
+        )
+        return try await operation.value()
     }
 }
 

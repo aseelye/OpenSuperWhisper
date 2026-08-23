@@ -1,9 +1,8 @@
 import Foundation
 import os
 
-// TranscriptionBackend is intentionally kept as the app's existing internal
-// preference enum while the provider migration is in progress.  The enum has
-// no mutable or reference state, so it is safe to carry in a diagnostic value.
+// TranscriptionBackend is the app's persisted provider selection. The enum
+// has no mutable or reference state, so it is safe to carry in diagnostics.
 extension TranscriptionBackend: @unchecked Sendable {}
 
 /// A bounded category for local operation diagnostics.  Categories carry no

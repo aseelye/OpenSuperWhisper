@@ -12,7 +12,6 @@ public enum OpenAITranscriptionEngineError: LocalizedError, Equatable, Sendable 
     case responseDecodingFailed
     case network(URLError)
     case chunkingFailed(String)
-    case liveTranscriptionUnavailable
     case cancelled
 
     public var errorDescription: String? {
@@ -36,8 +35,6 @@ public enum OpenAITranscriptionEngineError: LocalizedError, Equatable, Sendable 
             return "Network error contacting OpenAI: \(error.localizedDescription)"
         case let .chunkingFailed(message):
             return "Unable to split the audio for OpenAI: \(message)"
-        case .liveTranscriptionUnavailable:
-            return "OpenAI transcription starts after recording stops."
         case .cancelled:
             return "OpenAI transcription was cancelled."
         }
@@ -178,7 +175,7 @@ public struct OpenAITranscriptionConfiguration: Sendable {
 /// OpenAI's completed-file transcription implementation. It intentionally
 /// does not open a realtime session: the selected gpt-transcribe workflow is
 /// an upload made after capture has stopped.
-public final class OpenAITranscriptionEngine: @unchecked Sendable, TranscriptionEngine, TranscriptionProvider {
+public final class OpenAITranscriptionEngine: @unchecked Sendable, TranscriptionProvider {
     public static let model = "gpt-transcribe"
     public let strategy: RecordingTranscriptionStrategy = .fileAfterCapture
 
@@ -189,9 +186,6 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
     private let sleep: @Sendable (UInt64) async throws -> Void
     fileprivate let fileSystem: any OpenAITranscriptionFileSystem
     fileprivate let diagnosticSink: any TranscriptionDiagnosticSink
-    private let operationLock = NSLock()
-    private weak var activeOperation: OpenAIFileTranscriptionOperation?
-
     init(
         session: URLSession? = nil,
         apiKeyLoader: @escaping @Sendable () throws -> String? = {
@@ -300,53 +294,6 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
     ) throws -> (any TranscriptionLiveOperation)? {
         _ = (locale, context, expectedTerms)
         return nil
-    }
-
-    public func prepare(locale: Locale) async throws {
-        // There is no model or language asset to download for OpenAI. Keeping
-        // preparation as a no-op lets the controller use the same lifecycle
-        // for local and cloud engines.
-        _ = locale
-    }
-
-    public func startSession(
-        locale: Locale,
-        context: String?,
-        expectedTerms: [String]
-    ) async throws -> any LiveTranscriptionSession {
-        _ = (locale, context, expectedTerms)
-        throw OpenAITranscriptionEngineError.liveTranscriptionUnavailable
-    }
-
-    public func transcribeFile(
-        at url: URL,
-        locale: Locale,
-        context: String?,
-        expectedTerms: [String]
-    ) async throws -> Transcript {
-        let operation = try makeFileOperation(
-            at: url,
-            locale: locale,
-            context: context,
-            expectedTerms: expectedTerms
-        )
-        guard let concrete = operation as? OpenAIFileTranscriptionOperation else {
-            return try await operation.value()
-        }
-        operationLock.withLock { activeOperation = concrete }
-        defer {
-            operationLock.withLock {
-                if activeOperation === concrete { activeOperation = nil }
-            }
-        }
-        return try await concrete.value()
-    }
-
-    /// Cancels the active upload. URLSession also observes cancellation of the
-    /// caller's task, so both controller-driven and task-driven cancellation
-    /// stop network work promptly.
-    public func cancel() {
-        operationLock.withLock { activeOperation }?.requestCancel()
     }
 
     // MARK: - Multipart and normalization helpers
@@ -577,9 +524,8 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
     }
 }
 
-/// One independently cancellable OpenAI upload. The engine remains a thin
-/// compatibility adapter; this handle owns every child task and temporary
-/// artifact for the provider boundary.
+/// One independently cancellable OpenAI upload. The handle owns every child
+/// task and temporary artifact for the provider boundary.
 private final class OpenAIFileTranscriptionOperation: @unchecked Sendable, TranscriptionFileOperation {
     let events: AsyncStream<TranscriptionOperationEvent>
 
@@ -649,8 +595,8 @@ private final class OpenAIFileTranscriptionOperation: @unchecked Sendable, Trans
         _ = try? await task?.value
     }
 
-    /// Compatibility cancellation is synchronous while still reaching the
-    /// request, export/chunker task, and retry delay immediately.
+    /// Synchronous cancellation request used by the operation's termination
+    /// callback; `cancelAndWait()` remains the public quiescence boundary.
     func requestCancel() {
         _ = requestCancelAndReturnTask()
     }

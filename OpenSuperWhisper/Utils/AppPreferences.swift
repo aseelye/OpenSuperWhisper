@@ -21,25 +21,6 @@ struct UserDefault<T> {
     }
 }
 
-/// A small optional UserDefaults wrapper kept for preferences that genuinely
-/// have a three-state value. Setting nil removes the key instead of storing an
-/// Objective-C null sentinel.
-@propertyWrapper
-struct OptionalUserDefault<T> {
-    let key: String
-
-    var wrappedValue: T? {
-        get { UserDefaults.standard.object(forKey: key) as? T }
-        set {
-            if let newValue {
-                UserDefaults.standard.set(newValue, forKey: key)
-            } else {
-                UserDefaults.standard.removeObject(forKey: key)
-            }
-        }
-    }
-}
-
 /// User-facing preferences. The migration is intentionally performed before
 /// any property is read so new installations and upgrades share exactly the
 /// same defaults.
@@ -136,6 +117,8 @@ final class AppPreferences {
     /// Performs the one-time migration from whisper.cpp preferences and
     /// storage. It is intentionally idempotent and records completion only
     /// after the old directory is absent or has been removed successfully.
+    /// The legacy keys are user-data compatibility, not runtime adapters;
+    /// their removal is gated on the versioned 1.0 upgrade decision.
     @discardableResult
     static func migrateLegacyPreferencesIfNeeded(
         defaults: UserDefaults = .standard,

@@ -3,20 +3,150 @@ name: Build Check
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_ui_integration:
+        description: Run the opt-in macOS UI/integration lane (requires local permissions)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opensuperwhisper-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 
 jobs:
-  build:
-    runs-on: macos-latest
+  build-and-unit:
+    name: Build and unit tests (macOS 26 arm64)
+    runs-on: macos-26
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
-      - name: Set up Ruby (for xcpretty)
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
-      - name: Install xcpretty
-        run: gem install xcpretty
-      - name: Make run.sh executable
-        run: chmod +x ./run.sh
-      - name: Build with run.sh
-        run: ./run.sh build
+
+      - name: Assert supported runner and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          os_version="$(sw_vers -productVersion)"
+          case "$os_version" in
+            26.*) ;;
+            *) echo "Expected macOS 26, found $os_version" >&2; exit 1 ;;
+          esac
+          xcode_line="$(xcodebuild -version | sed -n '1p')"
+          test "$xcode_line" = "Xcode 26.6"
+          sdk_version="$(xcrun --sdk macosx --show-sdk-version)"
+          case "$sdk_version" in
+            26.*) ;;
+            *) echo "Expected macOS SDK 26.x, found $sdk_version" >&2; exit 1 ;;
+          esac
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+
+      - name: Assert the workspace is the only SwiftPM lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e Package.resolved
+          test -f OpenSuperWhisper.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          grep -F '"version" : "7.5.0"' OpenSuperWhisper.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          grep -F '"version" : "2.3.0"' OpenSuperWhisper.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+      - name: Resolve packages in the job-local cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/ci-resolution/DerivedData build/ci-resolution/SourcePackages
+          xcodebuild -resolvePackageDependencies \
+            -project OpenSuperWhisper.xcodeproj \
+            -scheme OpenSuperWhisper \
+            -derivedDataPath build/ci-resolution/DerivedData \
+            -clonedSourcePackagesDirPath build/ci-resolution/SourcePackages
+
+      - name: Check shell syntax and release harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          zsh -n run.sh
+          bash -n make_release.sh notarize_app.sh publish_release.sh tests/release/test_release_safety.sh
+          bash tests/release/test_release_safety.sh
+
+      - name: Build without launching the app
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./run.sh
+          ./run.sh build 2>&1 | tee build/logs/ci-build.log
+
+      - name: Run the 100-test unit suite serially
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_PARALLEL_TESTING=NO XCODE_TEST_WORKERS=1 ./run.sh test 2>&1 | tee build/logs/ci-unit-test.log
+          grep -F 'Executed 100 tests, with 0 failures' build/logs/ci-unit-test.log
+
+      - name: Check the diff
+        shell: bash
+        run: git diff --check
+
+  ui-integration:
+    name: Opt-in UI/macOS integration tests
+    needs: build-and-unit
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_ui_integration == true }}
+    runs-on: macos-26
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Assert supported runner and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "26"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 26.6"
+          case "$(xcrun --sdk macosx --show-sdk-version)" in
+            26.*) ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Validate the shared UI scheme
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -list -project OpenSuperWhisper.xcodeproj
+          xcodebuild -showBuildSettings -project OpenSuperWhisper.xcodeproj -scheme OpenSuperWhisperUI >/dev/null
+
+      - name: Run UI/integration lane with ad-hoc signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'This opt-in lane may require macOS Automation/Accessibility permission for XCUITest; its launch mode bypasses app microphone/accessibility prompts and does not record audio.'
+          mkdir -p build/ui-integration/DerivedData build/ui-integration/SourcePackages
+          xcodebuild \
+            -project OpenSuperWhisper.xcodeproj \
+            -scheme OpenSuperWhisperUI \
+            -configuration Debug \
+            -jobs 8 \
+            -derivedDataPath build/ui-integration/DerivedData \
+            -clonedSourcePackagesDirPath build/ui-integration/SourcePackages \
+            -destination 'platform=macOS,arch=arm64' \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            -parallel-testing-enabled NO \
+            -only-testing:OpenSuperWhisperUITests \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            MACOSX_DEPLOYMENT_TARGET=26.0 \
+            test

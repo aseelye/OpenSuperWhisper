@@ -43,13 +43,15 @@ public protocol AppleSpeechLiveSessionDriverFactory: Sendable {
     ) async throws -> any AppleSpeechLiveSessionDriver
 }
 
+// Compatibility spellings remain available through the pre-1.0 migration
+// window; the operation-handle protocols above are the canonical declarations.
 public typealias AppleSpeechLiveDriver = AppleSpeechLiveSessionDriver
 public typealias AppleSpeechLiveDriverFactory = AppleSpeechLiveSessionDriverFactory
 
 /// On-device transcription backed by macOS 26's SpeechAnalyzer and
 /// SpeechTranscriber. The analyzer retains its model for the process lifetime
 /// and the asset manager keeps the selected locale reserved between sessions.
-public final class AppleSpeechTranscriptionEngine: TranscriptionEngine, TranscriptionProvider, @unchecked Sendable {
+public final class AppleSpeechTranscriptionEngine: TranscriptionProvider, @unchecked Sendable {
     public let strategy: RecordingTranscriptionStrategy = .live
     private let configuredAssetManager: (any AppleSpeechAssetManaging)?
     private let analyzerPriority: TaskPriority
@@ -87,38 +89,6 @@ public final class AppleSpeechTranscriptionEngine: TranscriptionEngine, Transcri
         )
     }
 
-    public func prepare(locale: Locale) async throws {
-        _ = try await prepareAndResolve(locale: locale)
-    }
-
-    public func startSession(
-        locale: Locale,
-        context: String? = nil,
-        expectedTerms: [String] = []
-    ) async throws -> any LiveTranscriptionSession {
-        let operation = try makeLiveOperation(
-            locale: locale,
-            context: context,
-            expectedTerms: expectedTerms
-        )
-        guard let operation else {
-            throw CoreTranscriptionError.unavailable
-        }
-        do {
-            try await operation.start()
-            guard let concrete = operation as? AppleSpeechLiveTranscriptionOperation else {
-                throw CoreTranscriptionError.unavailable
-            }
-            return AppleSpeechLegacyLiveSessionAdapter(concrete)
-        } catch is CancellationError {
-            await operation.cancelAndWait()
-            throw CoreTranscriptionError.cancelled
-        } catch {
-            await operation.cancelAndWait()
-            throw error
-        }
-    }
-
     /// Synchronously reserves a live handle. Asset preparation and Speech
     /// analyzer construction start only when the caller awaits `start()`.
     public func makeLiveOperation(
@@ -143,7 +113,7 @@ public final class AppleSpeechTranscriptionEngine: TranscriptionEngine, Transcri
         expectedTerms: [String]
     ) throws -> any TranscriptionFileOperation {
         AppleSpeechFileTranscriptionOperation { [self] in
-            try await transcribeFile(
+            try await transcribeFileValue(
                 at: url,
                 locale: locale,
                 context: context,
@@ -152,7 +122,7 @@ public final class AppleSpeechTranscriptionEngine: TranscriptionEngine, Transcri
         }
     }
 
-    public func transcribeFile(
+    private func transcribeFileValue(
         at url: URL,
         locale: Locale,
         context: String? = nil,
@@ -277,7 +247,7 @@ public final class AppleSpeechTranscriptionEngine: TranscriptionEngine, Transcri
     }
 }
 
-private final actor AppleSpeechLiveTranscriptionSession: AppleSpeechLiveSessionDriver, LiveTranscriptionSession {
+private final actor AppleSpeechLiveTranscriptionSession: AppleSpeechLiveSessionDriver {
     private enum LifecycleState {
         case active
         case inputEnded
@@ -419,10 +389,10 @@ private final actor AppleSpeechLiveTranscriptionSession: AppleSpeechLiveSessionD
     }
 
     func finish() async throws -> Transcript {
-        try await finalize()
+        try await finishAnalysis()
     }
 
-    func finalize() async throws -> Transcript {
+    private func finishAnalysis() async throws -> Transcript {
         switch lifecycleState {
         case .finished:
             return assembler.transcript
@@ -1103,30 +1073,6 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
         stateLock.unlock()
         eventContinuation.finish()
         updateContinuation.finish()
-    }
-}
-
-/// Legacy adapter retained until the Wave 2 controller consumes operation
-/// handles directly. It does not own a second task or buffering path.
-private final class AppleSpeechLegacyLiveSessionAdapter: LiveTranscriptionSession, @unchecked Sendable {
-    let updates: AsyncStream<TranscriptUpdate>
-    private let operation: AppleSpeechLiveTranscriptionOperation
-
-    init(_ operation: AppleSpeechLiveTranscriptionOperation) {
-        self.operation = operation
-        self.updates = operation.updates
-    }
-
-    func append(buffer: AVAudioPCMBuffer) async throws {
-        try await operation.append(buffer: buffer)
-    }
-
-    func finalize() async throws -> Transcript {
-        try await operation.finish()
-    }
-
-    func cancel() async {
-        await operation.cancelAndWait()
     }
 }
 

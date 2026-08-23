@@ -190,8 +190,8 @@ public extension TranscriptionLiveOperation {
     }
 }
 
-// Compatibility spellings make the role names easy to discover while keeping
-// one canonical protocol declaration for downstream implementations.
+// Compatibility spellings remain available through the pre-1.0 migration
+// window; the operation protocols above are the canonical declarations.
 public typealias FileTranscriptionOperation = TranscriptionFileOperation
 public typealias LiveTranscriptionOperation = TranscriptionLiveOperation
 
@@ -201,7 +201,7 @@ public enum RecordingTranscriptionStrategy: String, CaseIterable, Codable, Hasha
     case fileAfterCapture
 }
 
-/// Provider boundary for the post-compatibility operation handles.
+/// Provider boundary for operation handles.
 ///
 /// Factory methods are synchronous by design: construction reserves the
 /// operation handle before any asynchronous preparation, upload, or request

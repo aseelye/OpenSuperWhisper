@@ -1,43 +1,94 @@
-# Codex Handoff – Current Architecture
+# Codex handoff: current architecture
 
-## TL;DR
+## Runtime contract
 
-- `DictationSessionController` owns capture, progressive updates, cancellation,
-  finalization, and persistence for both transcription providers.
-- Apple Speech is the default on-device provider and streams progressive
-  results while recording after its macOS language asset is available.
-- OpenAI uses completed-file uploads to `gpt-transcribe`, with chunking for
-  large recordings and retry/backoff for transient failures.
-- The repository builds through the normal Xcode/SwiftPM workflow; there are
-  no native transcription submodules, bundled model files, or model-build
-  steps.
+`DictationSessionController` is the single owner of a dictation operation.
+Main-window recording, shortcuts, file drops, and imported-file calls reserve
+a `SessionOperationToken` and source synchronously on `MainActor`. One context
+owns the capture/provider handles, audio URLs, phase/progress, paste intent,
+terminal outcome, persistence receipt, and any compensation. Published
+snapshots reject updates from stale tokens and expose the cancelling state
+until teardown and compensation finish.
 
-## Current State
+Capture is an async, operation-scoped handle. Admission closes before
+`stopAndDrain()` or `cancelAndDrain()` drains the writer; callbacks are
+ordered, delivered off the audio tap/writer queue, and never occur after the
+handle returns. The bounded live channel holds five seconds of audio. Overflow
+closes capture, preserves the complete WAV in Recovery, and reports a typed
+terminal error.
 
-- `OpenSuperWhisper/TranscriptionCore.swift` defines provider-neutral
-  transcripts, updates, engine protocols, and shared errors.
-- `OpenSuperWhisper/DictationSessionController.swift` coordinates recording,
-  live sessions, completed-file transcription, cancellation, and final-only
-  history writes.
-- `OpenSuperWhisper/AudioCaptureService.swift` owns AVAudioEngine capture and
-  temporary WAV recording files.
-- `OpenSuperWhisper/AppleSpeechTranscriptionEngine.swift` uses
-  `SpeechAnalyzer`/`SpeechTranscriber` for progressive on-device results.
-- `OpenSuperWhisper/OpenAITranscriptionEngine.swift` uploads completed files,
-  keeps uploads below the 25 MB API limit, stitches chunks, and applies the
-  configured retry policy.
-- `OpenSuperWhisper/FileDropHandler.swift` routes dropped audio through the
-  same controller and surfaces provider errors to the UI.
-- `AppPreferences` migrates old provider-neutral settings and removes only
-  the known legacy model/preferences keys during upgrade.
+Providers expose native operation handles. Apple Speech is the live provider:
+the Speech analyzer/session streams updates and is teardown-safe on success,
+failure, cancellation, and abandoned streams. OpenAI is the file-after-capture
+provider: its handle owns export, chunk subdivision, multipart upload, retry
+backoff, cancellation, and temporary-file cleanup. The controller selects the
+provider through the explicit recording strategy; no runtime caller depends on
+the removed synchronous engine/session bridge or a fake live OpenAI path.
 
-## Validation and follow-up
+The local diagnostic sink records bounded operation identifiers, source,
+backend, phase, capture generation, chunk index, and cleanup/compensation
+outcomes. It never records transcript text, prompts, keys, request bodies, or
+audio.
 
-- Exercise Apple Speech with an installed language asset and verify
-  progressive updates, cancellation, and final history persistence.
-- Exercise OpenAI with a Keychain API key using both a small file and a file
-  large enough to trigger chunking; verify cleanup after success and failure.
-- GitHub Actions uses the same ordinary Xcode build invoked by `run.sh`.
+## History and recovery
 
-Keep generated logs out of source control; update this handoff when the
-current architecture or validation status changes.
+`RecordingStore` is injectable and nonfatal. Its status is loading, available,
+stale-with-error, or unavailable. Durable insertion returns a commit receipt;
+publication failure therefore cannot make a committed row ambiguous.
+
+Saving remains a row-plus-file operation. If history is unavailable after a
+successful transcription, the controller copies the transcript to the
+clipboard, preserves owned audio in the app's `Application Support/<bundle>/Recovery`
+directory, and presents a nonfatal history warning. Cancellation after insert
+compensates through the receipt and remains cancelling until that work settles;
+failed compensation produces a repair-required warning.
+
+Rows with missing audio retain transcript metadata and offer “Locate Audio…”
+or “Remove Entry”. Startup reconciliation only scans app-owned recording,
+temporary-capture, and quarantine names. Orphan/incomplete files are moved to
+Recovery and surfaced; unknown files are left untouched. Deletion quarantines
+audio before the database transaction and restores it if that transaction
+fails. The history UI offers recovery-folder access, confirmed removal, and
+history retry.
+
+## Preferences and upgrade compatibility
+
+The stable Codable/persisted preference boundary remains intact. Upgrades still
+accept the legacy `local` backend value, migrate `whisperLanguage` to the
+provider-neutral locale, preserve useful prompt/timestamp settings, and remove
+only the enumerated whisper/model keys and exact legacy model directory.
+These are user-data migrations, not transitional runtime protocols or
+adapters. Keep them through the pre-1.0 line. Removing a migration key or
+decoder requires a versioned 1.0 gate: publish the oldest-supported upgrade
+matrix, validate an install/upgrade sample, and make that removal an explicit
+release decision.
+
+## Validation lanes
+
+The shared `OpenSuperWhisper` scheme runs the 100-test unit target and skips
+the template/UI target. The `OpenSuperWhisperUI` shared scheme is a separate,
+serialized lane. Ordinary CI runs on the official `macos-26` arm64 image with
+Xcode 26.6, asserts macOS/SDK/architecture, resolves from the workspace lock,
+builds without launching the app, runs the 100 unit tests, checks shell syntax,
+and runs the disposable release harness. CI never depends on a user database,
+shared defaults, or real network calls.
+
+The UI lane is workflow-dispatch-only. It validates the shared scheme and uses
+ad-hoc signing. Its four tests use the UI launch mode and an isolated HOME, so
+they bypass the app's microphone/accessibility gate and do not record or
+install Speech assets; the runner may still need macOS
+Automation/Accessibility permission for XCUITest itself. This host previously
+timed out while enabling automation mode; do not run UI automation as part of
+ordinary local verification. Use manual macOS acceptance for real
+microphone/device changes, asset downloads, VoiceOver, history repair, and
+signed/notarized artifacts.
+
+## Known limitations and handoff notes
+
+Apple Speech requires the selected macOS language asset and remains local.
+OpenAI requires a Keychain API key, uploads completed files to `gpt-transcribe`,
+and reports network/rate-limit/size errors without automatic cloud fallback.
+Extensionless-media and regional-Chinese behavior remain deferred until an
+endpoint contract demonstrates a failure. Generated logs and derived data
+belong under ignored `build/`; keep Xcode operations serial while diagnosing
+and confirm no app/test processes remain before the next invocation.

@@ -8,6 +8,8 @@ enum TranscriptionBackend: String, CaseIterable, Identifiable {
     /// `local` was the value persisted by releases that used whisper.cpp.
     /// Keep accepting it at the boundary so an upgrade never silently falls
     /// back to a cloud provider. New writes always use `appleSpeech`.
+    /// Removal gate: retain through pre-1.0 releases; remove only with the
+    /// versioned 1.0 upgrade matrix and an explicit release decision.
     init?(rawValue: String) {
         switch rawValue {
         case "local":

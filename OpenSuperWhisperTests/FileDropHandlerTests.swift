@@ -80,6 +80,7 @@ final class FileDropHandlerTests: XCTestCase {
             await handler.handleDrop(of: [self.audioProvider()])
         }
         await waitForTestEvent(callbackReady, description: "provider callback seam")
+        let token = try XCTUnwrap(handler.operationToken)
         XCTAssertTrue(handler.isTranscribing)
         XCTAssertTrue(handler.cancelTranscription())
         XCTAssertEqual(controller.snapshot.phase, .cancelling)
@@ -89,6 +90,7 @@ final class FileDropHandlerTests: XCTestCase {
         // must not start an import, paste, error banner, or replacement.
         providerCompletion?(.success(sourceURL))
         await task.value
+        _ = await controller.cancelRecordingAndWait(token: token)
         XCTAssertFalse(handler.isTranscribing)
         XCTAssertNil(handler.errorMessage)
         XCTAssertNil(controller.operationToken)

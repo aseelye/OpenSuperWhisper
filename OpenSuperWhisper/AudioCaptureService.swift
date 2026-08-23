@@ -270,17 +270,6 @@ private final class AudioCaptureAdmissionState: @unchecked Sendable {
         lock.withLock { resources?.destination }
     }
 
-    var isCapturing: Bool {
-        lock.withLock {
-            switch phase {
-            case .starting, .running, .draining:
-                return true
-            case .idle, .finished:
-                return false
-            }
-        }
-    }
-
     func reserve() throws {
         try lock.withLock {
             guard phase == .idle else {
@@ -429,10 +418,6 @@ private final class AudioCaptureServiceLease: @unchecked Sendable {
     private let lock = NSLock()
     private var activeGeneration: UInt64?
 
-    var isReserved: Bool {
-        lock.withLock { activeGeneration != nil }
-    }
-
     func reserve(_ generation: UInt64) throws {
         try lock.withLock {
             guard activeGeneration == nil else {
@@ -565,12 +550,6 @@ public final class AudioCaptureSession: DictationAudioCaptureSession, @unchecked
         state.currentRecordingURL
     }
 
-    /// Useful to the temporary synchronous compatibility adapter; new callers
-    /// should use the async session methods and not inspect lifecycle state.
-    public var isCapturing: Bool {
-        state.isCapturing
-    }
-
     public func start(onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void) async throws {
         try await withTaskCancellationHandler(operation: {
             try await coordinator.start(onBuffer: onBuffer)
@@ -585,10 +564,6 @@ public final class AudioCaptureSession: DictationAudioCaptureSession, @unchecked
                 await coordinator.cancelAndDrain()
             }
         })
-    }
-
-    public func start() async throws {
-        try await start(onBuffer: { _ in })
     }
 
     deinit {
@@ -855,7 +830,7 @@ private actor AudioCaptureSessionCoordinator {
     }
 }
 
-// MARK: - Service/factory and compatibility bridge
+// MARK: - Service/factory
 
 /// Factory for operation-scoped capture sessions.
 public final class AudioCaptureService: DictationAudioCaptureFactory, @unchecked Sendable {
@@ -864,8 +839,7 @@ public final class AudioCaptureService: DictationAudioCaptureFactory, @unchecked
     private let configuration: AudioCaptureConfiguration
     private let dependencies: AudioCaptureDependencies
     private let serviceLease = AudioCaptureServiceLease()
-    private let legacyLock = NSLock()
-    private var legacySession: AudioCaptureSession?
+    private let generationLock = NSLock()
     private var nextGeneration: UInt64 = 0
 
     public init(
@@ -898,19 +872,7 @@ public final class AudioCaptureService: DictationAudioCaptureFactory, @unchecked
     }
 
     public func makeSession() -> any DictationAudioCaptureSession {
-        makeConcreteSession()
-    }
-
-    /// Convenience overload used by file-oriented adapters and deterministic
-    /// tests that need a stable destination path.
-    public func makeSession(fileURL: URL?) -> AudioCaptureSession {
-        makeConcreteSession(fileURL: fileURL)
-    }
-
-    /// Concrete overload for tests that need to inspect operation state. New
-    /// orchestration should depend on the frozen protocol instead.
-    public func makeConcreteSession(fileURL: URL? = nil) -> AudioCaptureSession {
-        let generation = legacyLock.withLock {
+        let generation = generationLock.withLock {
             nextGeneration &+= 1
             return nextGeneration
         }
@@ -918,130 +880,8 @@ public final class AudioCaptureService: DictationAudioCaptureFactory, @unchecked
             configuration: configuration,
             dependencies: dependencies,
             generation: generation,
-            fileURL: fileURL,
+            fileURL: nil,
             serviceLease: serviceLease
         )
-    }
-
-    private func makeConcreteSession() -> AudioCaptureSession {
-        makeConcreteSession(fileURL: nil)
-    }
-
-    public var isCapturing: Bool {
-        legacyLock.withLock { legacySession?.isCapturing ?? serviceLease.isReserved }
-    }
-
-    public var currentRecordingURL: URL? {
-        legacyLock.withLock { legacySession?.currentRecordingURL }
-    }
-
-    public var canRecord: Bool {
-        let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.microphone, .external],
-            mediaType: .audio,
-            position: .unspecified
-        )
-        return !discoverySession.devices.isEmpty
-    }
-
-    // Retained solely for the pre-Wave-2 adapter. New code must use
-    // makeSession() and its async lifecycle methods.
-    @available(*, deprecated, message: "Use makeSession().start(onBuffer:) instead")
-    @discardableResult
-    public func startCapture(
-        fileURL: URL? = nil,
-        onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)? = nil
-    ) throws -> URL {
-        let session = makeConcreteSession(fileURL: fileURL)
-        legacyLock.lock()
-        guard legacySession == nil else {
-            legacyLock.unlock()
-            throw AudioCaptureError.alreadyCapturing
-        }
-        legacySession = session
-        legacyLock.unlock()
-
-        do {
-            try blockingAwait {
-                try await session.start { buffer in
-                    onBuffer?(buffer)
-                }
-            }
-            guard let url = session.currentRecordingURL else {
-                throw AudioCaptureError.engineStartFailed("Capture started without a destination file.")
-            }
-            return url
-        } catch {
-            clearLegacySession(ifIdenticalTo: session)
-            throw error
-        }
-    }
-
-    @available(*, deprecated, message: "Use stopAndDrain() on the operation session instead")
-    @discardableResult
-    public func stopCapture() throws -> AudioCaptureResult {
-        guard let session = legacyLock.withLock({ legacySession }) else {
-            throw AudioCaptureError.notCapturing
-        }
-        do {
-            guard let result = try blockingAwait({ try await session.stopAndDrain() }) else {
-                throw AudioCaptureError.notCapturing
-            }
-            clearLegacySession(ifIdenticalTo: session)
-            return result
-        } catch {
-            clearLegacySession(ifIdenticalTo: session)
-            throw error
-        }
-    }
-
-    @available(*, deprecated, message: "Use cancelAndDrain() on the operation session instead")
-    public func cancelCapture() {
-        guard let session = legacyLock.withLock({ legacySession }) else { return }
-        try? blockingAwait {
-            await session.cancelAndDrain()
-            return ()
-        }
-        clearLegacySession(ifIdenticalTo: session)
-    }
-
-    private func clearLegacySession(ifIdenticalTo session: AudioCaptureSession) {
-        legacyLock.withLock {
-            if legacySession === session {
-                legacySession = nil
-            }
-        }
-    }
-
-    private func blockingAwait<T: Sendable>(
-        _ operation: @escaping @Sendable () async throws -> T
-    ) throws -> T {
-        let semaphore = DispatchSemaphore(value: 0)
-        let resultBox = BlockingResultBox<T>()
-        Task {
-            do {
-                resultBox.resolve(.success(try await operation()))
-            } catch {
-                resultBox.resolve(.failure(error))
-            }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return try resultBox.value.get()
-    }
-}
-
-private final class BlockingResultBox<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: Result<Value, Error>?
-
-    func resolve(_ result: Result<Value, Error>) {
-        lock.withLock { stored = result }
-    }
-
-    var value: Result<Value, Error> {
-        lock.withLock {
-            stored ?? .failure(AudioCaptureError.engineStartFailed("Capture bridge completed without a result."))
-        }
     }
 }
