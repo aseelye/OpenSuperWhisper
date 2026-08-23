@@ -131,9 +131,13 @@ public struct TranscriptUpdate: Codable, Equatable, Sendable {
     }
 }
 
-/// A provider-neutral stream of live updates. Concrete engines may add
-/// provider-specific preparation and diagnostics, but clients only need these
-/// operations to drive recording, shortcut bubbles, and final persistence.
+/// Migration compatibility for the pre-operation-handle runtime.
+///
+/// New provider work must use `TranscriptionLiveOperation` from
+/// `OperationCore.swift`.  This protocol remains temporarily so the current
+/// controller and concrete engines stay behavior-neutral and compile during
+/// the Wave 1/Wave 2 migration; it is scheduled for removal with
+/// `TranscriptionEngine` after the controller adopts the new contracts.
 public protocol LiveTranscriptionSession: AnyObject, Sendable {
     var updates: AsyncStream<TranscriptUpdate> { get }
 
@@ -142,9 +146,12 @@ public protocol LiveTranscriptionSession: AnyObject, Sendable {
     func cancel() async
 }
 
-/// A provider-neutral transcription engine. A live session accepts copied audio
-/// buffers; file transcription is used for dropped/imported recordings and
-/// backends that intentionally upload only after capture stops.
+/// Migration compatibility for the pre-operation-handle runtime.
+///
+/// New provider work must use `TranscriptionProvider` and its synchronous
+/// operation factories from `OperationCore.swift`.  This protocol is retained
+/// only until the existing controller and concrete engines migrate in Wave 2;
+/// do not add backend-specific branches to it.
 public protocol TranscriptionEngine: Sendable {
     func prepare(locale: Locale) async throws
     func startSession(
@@ -169,6 +176,10 @@ public enum CoreTranscriptionError: LocalizedError, Equatable, Sendable {
     case audioFormatUnavailable
     case audioCaptureFailed(String)
     case analyzerFailed(String)
+    /// The live provider could not keep up with admitted audio. This is a
+    /// recoverable terminal error; the capture boundary owns the WAV and can
+    /// move it to Recovery before presenting the failure.
+    case liveInputOverflow(maximumDuration: TimeInterval)
     case cancelled
     case invalidAudioFile(URL)
 
@@ -188,13 +199,210 @@ public enum CoreTranscriptionError: LocalizedError, Equatable, Sendable {
             return "Audio capture failed: \(message)"
         case let .analyzerFailed(message):
             return "Speech analysis failed: \(message)"
+        case let .liveInputOverflow(maximumDuration):
+            return "Live transcription could not keep up with \(Int(maximumDuration.rounded())) seconds of audio. The recording was preserved for recovery."
         case .cancelled:
             return "Transcription was cancelled."
         case let .invalidAudioFile(url):
             return "The audio file could not be opened: \(url.lastPathComponent)."
         }
     }
+
+    /// Compatibility spelling for callers that describe the same condition as
+    /// an audio backlog. There is still only one stored error case.
+    public static func audioBacklogOverflow(maximumDuration: TimeInterval) -> Self {
+        .liveInputOverflow(maximumDuration: maximumDuration)
+    }
+
+    public var isRecoverable: Bool {
+        if case .liveInputOverflow = self { return true }
+        return false
+    }
 }
+
+/// Terminal errors emitted by the bounded live-input channel. The channel is
+/// deliberately narrow and provider-neutral; it owns admission and ordering,
+/// while the provider owns the consumer task and analyzer resources.
+public enum TranscriptionLiveInputError: LocalizedError, Equatable, Sendable {
+    case notStarted
+    case closed
+    case overflow(maximumDuration: TimeInterval)
+    case cancelled
+
+    public var errorDescription: String? {
+        switch self {
+        case .notStarted:
+            return "Live transcription has not started."
+        case .closed:
+            return "Live transcription input is closed."
+        case let .overflow(maximumDuration):
+            return "Live transcription exceeded its \(Int(maximumDuration.rounded())) second audio backlog."
+        case .cancelled:
+            return "Live transcription was cancelled."
+        }
+    }
+
+    public var isRecoverable: Bool {
+        if case .overflow = self { return true }
+        return false
+    }
+}
+
+public typealias LiveAudioChannelError = TranscriptionLiveInputError
+
+/// A serial, bounded queue for copied microphone buffers.
+///
+/// The queue admits at most `maximumDuration` seconds of audio. It never drops
+/// or coalesces an admitted buffer: if the next buffer would exceed the bound,
+/// admission closes and the caller receives `.overflow`. A consumer drains
+/// already-admitted buffers before observing the terminal error.
+public final class BoundedLiveAudioChannel: @unchecked Sendable {
+    private final class BufferBox: @unchecked Sendable {
+        let buffer: AVAudioPCMBuffer
+        let duration: TimeInterval
+
+        init(buffer: AVAudioPCMBuffer, duration: TimeInterval) {
+            self.buffer = buffer
+            self.duration = duration
+        }
+    }
+
+    private struct Waiter {
+        let continuation: CheckedContinuation<AVAudioPCMBuffer?, Error>
+    }
+
+    private let lock = NSLock()
+    private let maximumDuration: TimeInterval
+    private var queue: [BufferBox] = []
+    private var queuedDuration: TimeInterval = 0
+    private var waiters: [Waiter] = []
+    private var terminalError: Error?
+    private var isClosed = false
+
+    public init(maximumDuration: TimeInterval = 5) {
+        self.maximumDuration = max(0.001, maximumDuration)
+    }
+
+    public var capacityDuration: TimeInterval { maximumDuration }
+
+    public var pendingDuration: TimeInterval {
+        lock.withLock { queuedDuration }
+    }
+
+    public var isOpen: Bool {
+        lock.withLock { !isClosed }
+    }
+
+    /// Admits one copied buffer. The operation is async only to make the
+    /// channel safe to use from any executor; admission itself never waits for
+    /// the consumer and therefore cannot grow without bound.
+    public func append(_ buffer: AVAudioPCMBuffer) async throws {
+        let duration = Self.duration(of: buffer)
+        let box = BufferBox(buffer: buffer, duration: duration)
+        var waiter: CheckedContinuation<AVAudioPCMBuffer?, Error>?
+        var errorToThrow: Error?
+
+        lock.lock()
+        if let terminalError {
+            errorToThrow = terminalError
+        } else if isClosed {
+            errorToThrow = TranscriptionLiveInputError.closed
+        } else if queuedDuration + duration > maximumDuration + 0.000_001 {
+            let overflow = TranscriptionLiveInputError.overflow(maximumDuration: maximumDuration)
+            terminalError = overflow
+            isClosed = true
+            errorToThrow = overflow
+            if queue.isEmpty, !waiters.isEmpty {
+                waiter = waiters.removeFirst().continuation
+            }
+        } else if let pending = waiters.first {
+            waiters.removeFirst()
+            waiter = pending.continuation
+        } else {
+            queue.append(box)
+            queuedDuration += duration
+        }
+        lock.unlock()
+
+        if let waiter {
+            if let errorToThrow {
+                waiter.resume(throwing: errorToThrow)
+            } else {
+                waiter.resume(returning: buffer)
+            }
+        }
+        if let errorToThrow { throw errorToThrow }
+    }
+
+    /// Labelled spelling used by provider code and external test fixtures.
+    public func append(buffer: AVAudioPCMBuffer) async throws {
+        try await append(buffer)
+    }
+
+    /// Returns the next admitted buffer, or `nil` after a normal `finish()`.
+    /// Already-admitted buffers are always delivered before a terminal error.
+    public func next() async throws -> AVAudioPCMBuffer? {
+        try await withCheckedThrowingContinuation { continuation in
+            var result: Result<AVAudioPCMBuffer?, Error>?
+            lock.lock()
+            if !queue.isEmpty {
+                let box = queue.removeFirst()
+                queuedDuration = max(0, queuedDuration - box.duration)
+                result = .success(box.buffer)
+            } else if let terminalError {
+                result = .failure(terminalError)
+            } else if isClosed {
+                result = .success(nil)
+            } else {
+                waiters.append(Waiter(continuation: continuation))
+            }
+            lock.unlock()
+            if let result { continuation.resume(with: result) }
+        }
+    }
+
+    /// Closes admission after all accepted buffers have been consumed.
+    public func finish() {
+        close(with: nil)
+    }
+
+    /// Closes admission and discards queued buffers as part of cancellation.
+    public func cancel() {
+        close(with: TranscriptionLiveInputError.cancelled, discardQueuedBuffers: true)
+    }
+
+    private func close(with error: Error?, discardQueuedBuffers: Bool = false) {
+        var waiters: [Waiter] = []
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            return
+        }
+        isClosed = true
+        terminalError = error
+        if discardQueuedBuffers {
+            queue.removeAll(keepingCapacity: false)
+            queuedDuration = 0
+        }
+        waiters = self.waiters
+        self.waiters.removeAll(keepingCapacity: false)
+        lock.unlock()
+        for waiter in waiters {
+            if let error { waiter.continuation.resume(throwing: error) }
+            else { waiter.continuation.resume(returning: nil) }
+        }
+    }
+
+    private static func duration(of buffer: AVAudioPCMBuffer) -> TimeInterval {
+        let sampleRate = buffer.format.sampleRate
+        guard sampleRate.isFinite, sampleRate > 0 else { return 0 }
+        return max(0, Double(buffer.frameLength) / sampleRate)
+    }
+}
+
+/// Compatibility spelling retained for clients migrating from the old live
+/// appender. It is a type alias, not a second buffering implementation.
+public typealias LiveAudioInputChannel = BoundedLiveAudioChannel
 
 /// Reconciles SpeechAnalyzer's range-based volatile and final results. Apple
 /// can revise text in a previously emitted range, so appending result strings

@@ -13,7 +13,8 @@ final class OnboardingViewModel: ObservableObject {
                 return
             }
             AppPreferences.shared.localeIdentifier = normalized
-            cancelProgressObservation()
+            guard !applyingResolvedLocale else { return }
+            cancelAssetWork()
             status = nil
             errorMessage = nil
             refreshAssetStatus()
@@ -26,8 +27,14 @@ final class OnboardingViewModel: ObservableObject {
     @Published var errorMessage: String?
 
     private let assetManager: any AppleSpeechAssetManaging
+    private var refreshTask: Task<Void, Never>?
     private var statusTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
+    private var preparationTask: Task<Void, Never>?
+    private var refreshRequestID: AppleSpeechAssetRequestID?
+    private var statusRequestID: AppleSpeechAssetRequestID?
+    private var preparationRequestID: AppleSpeechAssetRequestID?
+    private var applyingResolvedLocale = false
 
     init(assetManager: (any AppleSpeechAssetManaging)? = nil) {
         let resolvedAssetManager = assetManager ?? AppleSpeechAssetManager.shared
@@ -37,20 +44,44 @@ final class OnboardingViewModel: ObservableObject {
         self.assetManager = resolvedAssetManager
     }
 
+    deinit {
+        refreshTask?.cancel()
+        statusTask?.cancel()
+        progressTask?.cancel()
+        preparationTask?.cancel()
+    }
+
     var selectedLocale: Locale { LanguageUtil.locale(for: selectedLocaleIdentifier) }
     var selectedLocaleDisplayName: String { LanguageUtil.displayName(for: selectedLocaleIdentifier) }
     var isReady: Bool { status?.isReady == true }
 
     func refresh() {
-        Task { @MainActor [weak self] in
+        refreshTask?.cancel()
+        let requestID = AppleSpeechAssetRequestID()
+        refreshRequestID = requestID
+        let requestedIdentifier = selectedLocaleIdentifier
+        let assetManager = self.assetManager
+        refreshTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.refreshRequestID == requestID {
+                    self.refreshTask = nil
+                    self.refreshRequestID = nil
+                }
+            }
             guard let self else { return }
-            let locales = await assetManager.refresh()
+            let locales = await assetManager.refresh(requestID: requestID)
+            guard !Task.isCancelled,
+                  self.refreshRequestID == requestID,
+                  requestedIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
+                return
+            }
             if !locales.isEmpty {
                 availableLocaleIdentifiers = LanguageUtil.localeIdentifiers(for: locales)
                 if !availableLocaleIdentifiers.contains(where: { $0.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame }) {
                     selectedLocaleIdentifier = LanguageUtil.defaultLocaleIdentifier
                 }
             }
+            guard self.refreshRequestID == requestID else { return }
             refreshAssetStatus()
         }
     }
@@ -58,17 +89,26 @@ final class OnboardingViewModel: ObservableObject {
     func refreshAssetStatus() {
         statusTask?.cancel()
         cancelProgressObservation()
+        let requestID = AppleSpeechAssetRequestID()
+        statusRequestID = requestID
         let locale = selectedLocale
         let requestedIdentifier = LanguageUtil.localeIdentifier(for: locale)
         let assetManager = self.assetManager
         statusTask = Task { @MainActor [weak self] in
-            let refreshedStatus = await assetManager.status(for: locale)
+            defer {
+                if let self, self.statusRequestID == requestID {
+                    self.statusTask = nil
+                    self.statusRequestID = nil
+                }
+            }
+            let refreshedStatus = await assetManager.status(for: locale, requestID: requestID)
             guard let self,
                   !Task.isCancelled,
-                  requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                  self.statusRequestID == requestID,
+                  requestedIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
                 return
             }
-            status = refreshedStatus
+            self.status = refreshedStatus
         }
     }
 
@@ -76,35 +116,61 @@ final class OnboardingViewModel: ObservableObject {
         guard !isPreparing else { return }
         statusTask?.cancel()
         statusTask = nil
+        statusRequestID = nil
         cancelProgressObservation()
+        preparationTask?.cancel()
+        if let oldRequestID = preparationRequestID {
+            assetManager.cancelPreparation(requestID: oldRequestID)
+        }
         let requestedLocale = selectedLocale
         let requestedIdentifier = LanguageUtil.localeIdentifier(for: requestedLocale)
+        let requestID = AppleSpeechAssetRequestID()
+        preparationRequestID = requestID
         isPreparing = true
         errorMessage = nil
         status = AppleSpeechAssetStatus(locale: requestedLocale, state: .downloading, progress: 0)
-        observePreparationProgress(for: requestedIdentifier)
+        observePreparationProgress(for: requestedIdentifier, requestID: requestID)
 
-        Task { @MainActor [weak self] in
+        let assetManager = self.assetManager
+        preparationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                isPreparing = false
-                cancelProgressObservation()
+                if self.preparationRequestID == requestID {
+                    self.isPreparing = false
+                    self.preparationRequestID = nil
+                    self.preparationTask = nil
+                    self.cancelProgressObservation()
+                }
             }
             do {
-                let resolvedLocale = try await assetManager.prepare(locale: requestedLocale)
-                guard requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                let resolvedLocale = try await assetManager.prepare(
+                    locale: requestedLocale,
+                    requestID: requestID
+                )
+                guard !Task.isCancelled,
+                      self.preparationRequestID == requestID,
+                      requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
                     return
                 }
                 let identifier = LanguageUtil.localeIdentifier(for: resolvedLocale)
                 if identifier.caseInsensitiveCompare(selectedLocaleIdentifier) != .orderedSame {
+                    self.applyingResolvedLocale = true
                     selectedLocaleIdentifier = identifier
+                    self.applyingResolvedLocale = false
                 }
                 AppPreferences.shared.localeIdentifier = identifier
-                status = await assetManager.status(for: resolvedLocale)
+                let resolvedStatus = await assetManager.status(
+                    for: resolvedLocale,
+                    requestID: requestID
+                )
+                guard !Task.isCancelled, self.preparationRequestID == requestID else { return }
+                status = resolvedStatus
             } catch is CancellationError {
                 return
             } catch {
-                guard requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                guard self.preparationRequestID == requestID,
+                      !Task.isCancelled,
+                      requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
                     return
                 }
                 errorMessage = error.localizedDescription
@@ -118,12 +184,16 @@ final class OnboardingViewModel: ObservableObject {
         }
     }
 
-    private func observePreparationProgress(for requestedIdentifier: String) {
+    private func observePreparationProgress(
+        for requestedIdentifier: String,
+        requestID: AppleSpeechAssetRequestID
+    ) {
         let assetManager = self.assetManager
         progressTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 if let self {
                     guard self.isPreparing,
+                          self.preparationRequestID == requestID,
                           requestedIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
                         return
                     }
@@ -132,7 +202,13 @@ final class OnboardingViewModel: ObservableObject {
                        requestedIdentifier.caseInsensitiveCompare(
                            LanguageUtil.localeIdentifier(for: currentStatus.locale)
                        ) == .orderedSame {
-                        self.status = currentStatus
+                        // The manager is monotonic for an active request; the
+                        // view model repeats the guard so an old polling task
+                        // cannot project a late lower fraction.
+                        if self.status?.localeIdentifier.caseInsensitiveCompare(currentStatus.localeIdentifier) != .orderedSame
+                            || currentStatus.progress >= (self.status?.progress ?? 0) {
+                            self.status = currentStatus
+                        }
                     }
                 } else {
                     return
@@ -150,6 +226,26 @@ final class OnboardingViewModel: ObservableObject {
     private func cancelProgressObservation() {
         progressTask?.cancel()
         progressTask = nil
+    }
+
+    /// Cancels every asset task owned by the view model. The request ID is
+    /// sent to the manager before the slot is cleared so a Speech install that
+    /// is suspended in framework code cannot later commit as this view's work.
+    func cancelAssetWork() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshRequestID = nil
+        statusTask?.cancel()
+        statusTask = nil
+        statusRequestID = nil
+        cancelProgressObservation()
+        preparationTask?.cancel()
+        if let preparationRequestID {
+            assetManager.cancelPreparation(requestID: preparationRequestID)
+        }
+        preparationTask = nil
+        preparationRequestID = nil
+        isPreparing = false
     }
 }
 
@@ -242,6 +338,7 @@ struct OnboardingView: View {
         .frame(width: 450, height: 650)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { viewModel.refresh() }
+        .onDisappear { viewModel.cancelAssetWork() }
     }
 
     private var statusSymbol: String {

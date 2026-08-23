@@ -5,63 +5,70 @@ import XCTest
 @MainActor
 final class OnboardingViewModelTests: XCTestCase {
     func testPreparationForwardsMatchingLocaleProgressBeforeCompletion() async throws {
-        let originalLocale = AppPreferences.shared.localeIdentifier
-        defer { AppPreferences.shared.localeIdentifier = originalLocale }
-        AppPreferences.shared.localeIdentifier = "en-US"
-
-        let locale = Locale(identifier: "en-US")
-        let manager = ProgressAssetManager(locale: locale)
+        // Read the app's current locale but never change the shared defaults
+        // from a unit test.  The manager is entirely fixture-backed.
+        let manager = ProgressAssetManager()
         let viewModel = OnboardingViewModel(assetManager: manager)
+        let locale = viewModel.selectedLocale
+        manager.locale = locale
+        manager.supportedLocales = [locale]
 
         viewModel.prepareAsset()
-        try await waitUntil { manager.prepareStarted }
+        await waitForTestEvent(
+            manager.prepareStartedEvent,
+            description: "onboarding preparation to start"
+        )
 
         manager.currentStatus = AppleSpeechAssetStatus(
             locale: locale,
             state: .downloading,
             progress: 0.42
         )
-        try await waitUntil { viewModel.status?.progress == 0.42 }
+        await waitForViewModel(viewModel, description: "onboarding progress update") {
+            viewModel.status?.progress == 0.42
+        }
         XCTAssertTrue(viewModel.isPreparing)
 
-        manager.currentStatus = AppleSpeechAssetStatus(
-            locale: locale,
-            state: .installed,
-            progress: 1
-        )
-        manager.resumePreparation()
-        try await waitUntil { !viewModel.isPreparing }
-
-        XCTAssertEqual(viewModel.status?.state, .installed)
-        XCTAssertEqual(viewModel.status?.progress, 1)
+        // Cancellation exercises the completion path without having the
+        // production view model write AppPreferences.shared on behalf of the
+        // test process.
+        manager.cancelPreparation()
+        await waitForViewModel(viewModel, description: "onboarding cancellation") {
+            !viewModel.isPreparing
+        }
+        XCTAssertEqual(viewModel.status?.state, .downloading)
     }
 
-    private func waitUntil(
-        timeout: TimeInterval = 2,
+    private func waitForViewModel(
+        _ viewModel: OnboardingViewModel,
+        description: String,
         condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() >= deadline {
-                XCTFail("Timed out waiting for onboarding state")
-                return
+    ) async {
+        if condition() { return }
+        let event = TestEventRecorder()
+        let cancellable = viewModel.objectWillChange.sink { _ in
+            Task { @MainActor in
+                await Task.yield()
+                if condition() { event.record() }
             }
-            try await Task.sleep(nanoseconds: 10_000_000)
         }
+        defer { cancellable.cancel() }
+        await waitForTestEvent(event, description: description)
     }
 }
 
 @MainActor
 private final class ProgressAssetManager: AppleSpeechAssetManaging {
-    let locale: Locale
+    var locale: Locale
     var supportedLocales: [Locale]
     var installedLocales: [Locale] = []
     var activeLocale: Locale?
     var currentStatus: AppleSpeechAssetStatus?
     private(set) var prepareStarted = false
     private var preparationContinuation: CheckedContinuation<Locale, Error>?
+    let prepareStartedEvent = TestEventRecorder()
 
-    init(locale: Locale) {
+    init(locale: Locale = Locale(identifier: LanguageUtil.defaultLocaleIdentifier)) {
         self.locale = locale
         self.supportedLocales = [locale]
     }
@@ -78,11 +85,17 @@ private final class ProgressAssetManager: AppleSpeechAssetManaging {
         prepareStarted = true
         return try await withCheckedThrowingContinuation { continuation in
             preparationContinuation = continuation
+            prepareStartedEvent.record()
         }
     }
 
     func resumePreparation() {
         preparationContinuation?.resume(returning: locale)
+        preparationContinuation = nil
+    }
+
+    func cancelPreparation() {
+        preparationContinuation?.resume(throwing: CancellationError())
         preparationContinuation = nil
     }
 

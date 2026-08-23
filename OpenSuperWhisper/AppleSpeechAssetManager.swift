@@ -33,6 +33,30 @@ public struct AppleSpeechAssetStatus: Equatable, Sendable {
     public var localeIdentifier: String { locale.identifier }
 }
 
+/// Identity for one caller-owned asset request.
+///
+/// Asset work can outlive the task that started it (for example, while the
+/// Speech framework is unwinding an installation request).  Callers carry
+/// this value across suspension points and use it to cancel or reject a late
+/// completion without relying on task identity or object lifetime.
+public struct AppleSpeechAssetRequestID: Hashable, Sendable {
+    public let uuid: UUID
+
+    public init() {
+        self.uuid = UUID()
+    }
+
+    public init(_ uuid: UUID) {
+        self.uuid = uuid
+    }
+
+    public init(uuid: UUID) {
+        self.uuid = uuid
+    }
+
+    public var rawValue: UUID { uuid }
+}
+
 /// Injectable boundary for engine and settings tests. The concrete manager
 /// below talks to Apple's AssetInventory; tests can provide a deterministic
 /// implementation without downloading system language assets.
@@ -44,16 +68,51 @@ public protocol AppleSpeechAssetManaging: AnyObject {
     var currentStatus: AppleSpeechAssetStatus? { get }
 
     func refresh() async -> [Locale]
+    func refresh(requestID: AppleSpeechAssetRequestID) async -> [Locale]
     func supportedLocale(equivalentTo locale: Locale) async -> Locale?
     func status(for locale: Locale) async -> AppleSpeechAssetStatus
+    func status(
+        for locale: Locale,
+        requestID: AppleSpeechAssetRequestID
+    ) async -> AppleSpeechAssetStatus
     func prepare(locale: Locale) async throws -> Locale
-    func release(locale: Locale?) async
+    func prepare(
+        locale: Locale,
+        requestID: AppleSpeechAssetRequestID
+    ) async throws -> Locale
+    func cancelPreparation(requestID: AppleSpeechAssetRequestID)
+}
+
+public extension AppleSpeechAssetManaging {
+    func refresh(requestID: AppleSpeechAssetRequestID) async -> [Locale] {
+        await refresh()
+    }
+
+    func status(
+        for locale: Locale,
+        requestID: AppleSpeechAssetRequestID
+    ) async -> AppleSpeechAssetStatus {
+        await status(for: locale)
+    }
+
+    func prepare(
+        locale: Locale,
+        requestID: AppleSpeechAssetRequestID
+    ) async throws -> Locale {
+        try await prepare(locale: locale)
+    }
+
+    /// Compatibility default for fixture managers that predate explicit
+    /// preparation cancellation.  The production manager overrides this to
+    /// cancel only the matching waiter/operation.
+    func cancelPreparation(requestID: AppleSpeechAssetRequestID) {}
 }
 
 /// The asset manager owns Speech reservations for the process. Preparations
 /// are single-flight, and each successfully returned locale remains reserved
-/// until an explicit `release(locale:)` call (or process termination), so a
-/// locale switch cannot invalidate an analyzer that is still being built.
+/// until process termination, so a locale switch cannot invalidate an
+/// analyzer that is still being built. A reservation that was created for a
+/// superseded request before it was returned is explicitly released.
 @MainActor
 public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetManaging {
     public static let shared = AppleSpeechAssetManager()
@@ -83,7 +142,7 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
             status: @escaping @MainActor (Locale) async -> AppleSpeechAssetState,
             install: @escaping @MainActor (Locale) async throws -> Void,
             reserve: @escaping @MainActor (Locale) async -> Bool,
-            release: @escaping @MainActor (Locale) async -> Bool,
+            release: @escaping @MainActor (Locale) async -> Bool = { _ in true },
             waiterRegistered: (@MainActor () -> Void)? = nil,
             progressSource: TestProgressSource? = nil
         ) {
@@ -124,6 +183,7 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         let requestedIdentifier: String
         let generation: UInt64
         let identity: PreparationIdentity
+        let firstRequestID: AppleSpeechAssetRequestID
         let task: Task<Locale, Error>
         var waiterCount = 0
 
@@ -131,18 +191,34 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
             requestedIdentifier: String,
             generation: UInt64,
             identity: PreparationIdentity,
+            firstRequestID: AppleSpeechAssetRequestID,
             task: Task<Locale, Error>
         ) {
             self.requestedIdentifier = requestedIdentifier
             self.generation = generation
             self.identity = identity
+            self.firstRequestID = firstRequestID
             self.task = task
         }
     }
 
     private final class PreparationIdentity: @unchecked Sendable {}
 
-    private final class RefreshIdentity {}
+    private final class RefreshIdentity {
+        let requestID: AppleSpeechAssetRequestID
+
+        init(requestID: AppleSpeechAssetRequestID) {
+            self.requestID = requestID
+        }
+    }
+
+    private final class StatusIdentity {
+        let requestID: AppleSpeechAssetRequestID
+
+        init(requestID: AppleSpeechAssetRequestID) {
+            self.requestID = requestID
+        }
+    }
 
     /// A caller waits through its own continuation instead of awaiting the
     /// shared preparation task directly. This lets one canceled caller return
@@ -190,9 +266,12 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
     private var refreshTask: Task<Void, Never>?
     private var refreshIdentity: RefreshIdentity?
     private var refreshGeneration: UInt64 = 0
+    private var latestStatusIdentity: StatusIdentity?
     private var preparationOperation: PreparationOperation?
     private var latestPreparationGeneration: UInt64 = 0
     private var latestRequestedIdentifier: String?
+    private var preparationWaiters: [AppleSpeechAssetRequestID: PreparationWaiter] = [:]
+    private var cancelledPreparationRequestIDs = Set<AppleSpeechAssetRequestID>()
     private var retainedReservations: [String: Locale] = [:]
     private let testHooks: TestHooks?
 
@@ -215,10 +294,15 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
     /// hand-written language list that can drift from Speech's capabilities.
     @discardableResult
     public func refresh() async -> [Locale] {
+        await refresh(requestID: AppleSpeechAssetRequestID())
+    }
+
+    @discardableResult
+    public func refresh(requestID: AppleSpeechAssetRequestID) async -> [Locale] {
         refreshTask?.cancel()
         refreshGeneration &+= 1
         let generation = refreshGeneration
-        let identity = RefreshIdentity()
+        let identity = RefreshIdentity(requestID: requestID)
         refreshIdentity = identity
 
         let task = Task { @MainActor [weak self] in
@@ -245,7 +329,11 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
             }
         }
         refreshTask = task
-        await task.value
+        await withTaskCancellationHandler(operation: {
+            await task.value
+        }, onCancel: {
+            task.cancel()
+        })
         finishRefresh(identity: identity, generation: generation)
         return supportedLocales
     }
@@ -274,8 +362,21 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
     }
 
     public func status(for locale: Locale) async -> AppleSpeechAssetStatus {
+        await status(for: locale, requestID: AppleSpeechAssetRequestID())
+    }
+
+    public func status(
+        for locale: Locale,
+        requestID: AppleSpeechAssetRequestID
+    ) async -> AppleSpeechAssetStatus {
+        let identity = StatusIdentity(requestID: requestID)
+        latestStatusIdentity = identity
         let resolved = await supportedLocale(equivalentTo: locale) ?? locale
-        return await updateStatus(for: resolved, stateOnly: false)
+        return await updateStatus(
+            for: resolved,
+            stateOnly: false,
+            statusIdentity: identity
+        )
     }
 
     /// Downloads and reserves the requested locale. Calls for one locale
@@ -291,6 +392,20 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
     /// successful return still names a reserved asset.
     @discardableResult
     public func prepare(locale requestedLocale: Locale) async throws -> Locale {
+        try await prepare(
+            locale: requestedLocale,
+            requestID: AppleSpeechAssetRequestID()
+        )
+    }
+
+    @discardableResult
+    public func prepare(
+        locale requestedLocale: Locale,
+        requestID: AppleSpeechAssetRequestID
+    ) async throws -> Locale {
+        if cancelledPreparationRequestIDs.remove(requestID) != nil {
+            throw CoreTranscriptionError.cancelled
+        }
         let requestedIdentifier = localeKey(requestedLocale)
 
         if latestRequestedIdentifier != requestedIdentifier {
@@ -309,21 +424,27 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
                     // finish and let the loop create a fresh operation.
                     if operation.task.isCancelled || operation.waiterCount == 0 {
                         operation.task.cancel()
-                        _ = try? await waitForPreparation(operation)
+                        _ = try? await waitForPreparation(
+                            operation,
+                            requestID: AppleSpeechAssetRequestID()
+                        )
                         if preparationOperation === operation {
                             preparationOperation = nil
                         }
                         try ensureCallerIsNotCancelled()
                         continue
                     }
-                    return try await waitForPreparation(operation)
+                    return try await waitForPreparation(operation, requestID: requestID)
                 }
 
                 // Do not let two installs/reservations overlap. Cancellation
                 // is cooperative, so await the old task before retrying the
                 // loop and starting the newest request.
                 operation.task.cancel()
-                _ = try? await waitForPreparation(operation)
+                _ = try? await waitForPreparation(
+                    operation,
+                    requestID: AppleSpeechAssetRequestID()
+                )
                 try ensureCallerIsNotCancelled()
                 continue
             }
@@ -359,11 +480,27 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
                 requestedIdentifier: requestedIdentifier,
                 generation: requestGeneration,
                 identity: identity,
+                firstRequestID: requestID,
                 task: task
             )
             preparationOperation = operation
-            return try await waitForPreparation(operation)
+            return try await waitForPreparation(operation, requestID: requestID)
         }
+    }
+
+    /// Cancels only the caller identified by `requestID`. If it was the last
+    /// waiter, the shared installation task is canceled by the waiter cleanup
+    /// path. This lets multiple callers coalesce one preparation without one
+    /// caller accidentally canceling another caller's work.
+    public func cancelPreparation(requestID: AppleSpeechAssetRequestID) {
+        if let waiter = preparationWaiters[requestID] {
+            waiter.cancel()
+            return
+        }
+        // A request can be canceled in the tiny interval between its Task
+        // being created and entering this actor. Remember that cancellation so
+        // the request cannot start work when it eventually gets its turn.
+        cancelledPreparationRequestIDs.insert(requestID)
     }
 
     private func ensureCallerIsNotCancelled() throws {
@@ -372,10 +509,18 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         }
     }
 
-    private func waitForPreparation(_ operation: PreparationOperation) async throws -> Locale {
+    private func waitForPreparation(
+        _ operation: PreparationOperation,
+        requestID: AppleSpeechAssetRequestID
+    ) async throws -> Locale {
         operation.waiterCount += 1
         testHooks?.waiterRegistered?()
+        let waiter = PreparationWaiter()
+        preparationWaiters[requestID] = waiter
         defer {
+            if preparationWaiters[requestID] === waiter {
+                preparationWaiters.removeValue(forKey: requestID)
+            }
             operation.waiterCount -= 1
             if operation.waiterCount == 0 {
                 // A canceled/abandoned waiter must not leave an unneeded
@@ -384,7 +529,6 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
             }
         }
 
-        let waiter = PreparationWaiter()
         Task { [operation, waiter] in
             do {
                 waiter.complete(.success(try await operation.task.value))
@@ -509,21 +653,31 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         return locale
     }
 
-    /// Releases a reservation explicitly when a caller is intentionally
-    /// shutting down its speech subsystem. Normal app usage should not call
-    /// this; successful preparations are otherwise retained for process
-    /// lifetime so an analyzer can be constructed after a locale switch.
-    public func release(locale: Locale? = nil) async {
+    /// Releases an unneeded reservation for deterministic teardown tests or a
+    /// deliberate process-level shutdown. Normal app usage does not call this:
+    /// successful preparations are retained for process lifetime so an
+    /// analyzer can be constructed after a locale switch. It is intentionally
+    /// not part of `AppleSpeechAssetManaging`; no component owns a global
+    /// release authority other than this process-level manager.
+    internal func release(locale: Locale? = nil) async {
         guard let target = locale ?? activeLocale else { return }
         let key = localeKey(target)
         guard let retained = retainedReservations.removeValue(forKey: key) else {
-            if localeKeysEqual(activeLocale, target) {
-                activeLocale = nil
-                currentStatus = nil
+            if retainedReservations[key] == nil {
+                statusByIdentifier.removeValue(forKey: key)
+                if localeKeysEqual(activeLocale, target) {
+                    activeLocale = nil
+                    currentStatus = nil
+                }
             }
             return
         }
         _ = await releaseReservedAsset(locale: retained)
+        // A fresh preparation may have re-acquired the same key while the
+        // framework release was suspended. Never clear that newer request's
+        // status or active locale.
+        guard retainedReservations[key] == nil else { return }
+        statusByIdentifier.removeValue(forKey: key)
         if localeKeysEqual(activeLocale, target) {
             activeLocale = nil
             currentStatus = nil
@@ -590,8 +744,40 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         let status = AppleSpeechAssetStatus(
             locale: locale,
             state: .failed,
-            progress: statusByIdentifier[key]?.progress ?? currentStatus?.progress ?? 0,
+            progress: cachedProgress(for: key),
             errorMessage: message
+        )
+        currentStatus = status
+        statusByIdentifier[key] = status
+    }
+
+    private func cachedProgress(for key: String) -> Double {
+        let cached = statusByIdentifier[key]?.progress ?? 0
+        let projected = currentStatus.flatMap { localeKey($0.locale) == key ? $0.progress : nil } ?? 0
+        return max(cached, projected)
+    }
+
+    private func publishDownloadingProgress(
+        for locale: Locale,
+        progress: Double,
+        generation: UInt64,
+        identity: PreparationIdentity
+    ) {
+        guard isCurrentPreparation(generation: generation, identity: identity) else { return }
+        let key = localeKey(locale)
+        let value = min(max(progress, 0), 1)
+        // A late Progress/KVO callback must never move the active request
+        // backward. In particular, an initial callback can arrive after a
+        // cached status query has already reported a non-zero fraction.
+        let monotonicProgress = max(cachedProgress(for: key), value)
+        if currentStatus?.state == .installed,
+           localeKeysEqual(currentStatus?.locale, locale) {
+            return
+        }
+        let status = AppleSpeechAssetStatus(
+            locale: locale,
+            state: .downloading,
+            progress: monotonicProgress
         )
         currentStatus = status
         statusByIdentifier[key] = status
@@ -622,21 +808,23 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
     ) async throws {
         try ensurePreparationIsCurrent(generation: generation, identity: identity)
         if let testHooks {
-            let status = AppleSpeechAssetStatus(locale: locale, state: .downloading, progress: 0)
-            currentStatus = status
-            statusByIdentifier[localeKey(locale)] = status
+            publishDownloadingProgress(
+                for: locale,
+                progress: 0,
+                generation: generation,
+                identity: identity
+            )
             testHooks.progressSource?.register { [weak self] progress in
                 guard let self,
                       self.isCurrentPreparation(generation: generation, identity: identity) else {
                     return
                 }
-                let progressStatus = AppleSpeechAssetStatus(
-                    locale: locale,
-                    state: .downloading,
-                    progress: progress
+                self.publishDownloadingProgress(
+                    for: locale,
+                    progress: progress,
+                    generation: generation,
+                    identity: identity
                 )
-                self.currentStatus = progressStatus
-                self.statusByIdentifier[self.localeKey(locale)] = progressStatus
             }
             try await testHooks.install(locale)
             try ensurePreparationIsCurrent(generation: generation, identity: identity)
@@ -654,12 +842,12 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         // inventory below to keep the state machine correct for that case.
         if let request {
             let progress = request.progress
-            currentStatus = AppleSpeechAssetStatus(
-                locale: locale,
-                state: .downloading,
-                progress: progress.fractionCompleted
+            publishDownloadingProgress(
+                for: locale,
+                progress: progress.fractionCompleted,
+                generation: generation,
+                identity: identity
             )
-            statusByIdentifier[localeKey(locale)] = currentStatus
 
             let observation = progress.observe(\Progress.fractionCompleted, options: [.initial, .new]) { [weak self] progress, _ in
                 Task { @MainActor [weak self] in
@@ -667,13 +855,12 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
                           self.isCurrentPreparation(generation: generation, identity: identity) else {
                         return
                     }
-                    let status = AppleSpeechAssetStatus(
-                        locale: locale,
-                        state: .downloading,
-                        progress: progress.fractionCompleted
+                    self.publishDownloadingProgress(
+                        for: locale,
+                        progress: progress.fractionCompleted,
+                        generation: generation,
+                        identity: identity
                     )
-                    self.currentStatus = status
-                    self.statusByIdentifier[self.localeKey(locale)] = status
                 }
             }
             defer { observation.invalidate() }
@@ -707,6 +894,7 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         stateOnly: Bool,
         refreshIdentity: RefreshIdentity? = nil,
         refreshGeneration: UInt64? = nil,
+        statusIdentity: StatusIdentity? = nil,
         preparationIdentity: PreparationIdentity? = nil,
         preparationGeneration: UInt64? = nil
     ) async -> AppleSpeechAssetStatus {
@@ -726,10 +914,18 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         }
         let key = localeKey(locale)
         let previous = statusByIdentifier[key]
+        let previousProgress = cachedProgress(for: key)
         let status = AppleSpeechAssetStatus(
             locale: locale,
             state: state,
-            progress: state == .installed ? 1 : (stateOnly ? previous?.progress ?? 0 : 0),
+            // AssetInventory's status endpoint does not carry a fraction.
+            // Preserve the latest observed fraction for both refresh and
+            // direct status queries; an in-flight download must not jump back
+            // to zero just because a status read completed.
+            progress: state == .installed ? 1 : max(
+                previousProgress,
+                stateOnly ? previous?.progress ?? 0 : 0
+            ),
             errorMessage: state == .failed ? previous?.errorMessage : nil
         )
         if let preparationIdentity,
@@ -742,10 +938,19 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
            !isCurrentRefresh(identity: refreshIdentity, generation: refreshGeneration) {
             return status
         }
+        if let statusIdentity,
+           !isCurrentStatus(identity: statusIdentity) {
+            return status
+        }
         statusByIdentifier[key] = status
         if localeKeysEqual(activeLocale, locale) || currentStatus == nil {
             currentStatus = status
         }
         return status
+    }
+
+    private func isCurrentStatus(identity: StatusIdentity) -> Bool {
+        guard latestStatusIdentity === identity else { return false }
+        return !Task.isCancelled
     }
 }

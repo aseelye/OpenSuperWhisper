@@ -14,15 +14,29 @@ class AudioRecorder: NSObject, ObservableObject {
     private var notificationSound: NSSound?
     private let temporaryDirectory: URL
     private var currentRecordingURL: URL?
-    private var notificationObserver: Any?
+    private var deviceObserverTokens: [NSObjectProtocol] = []
+    private let notificationCenter: NotificationCenter
+    private let deviceAvailability: () -> Bool
 
     // MARK: - Singleton Instance
 
     static let shared = AudioRecorder()
     
-    override private init() {
+    init(
+        notificationCenter: NotificationCenter = .default,
+        deviceAvailability: (() -> Bool)? = nil
+    ) {
         let tempDir = FileManager.default.temporaryDirectory
         temporaryDirectory = tempDir.appendingPathComponent("temp_recordings")
+        self.notificationCenter = notificationCenter
+        self.deviceAvailability = deviceAvailability ?? {
+            let discoverySession = AVCaptureDevice.DiscoverySession(
+                deviceTypes: [.microphone, .external],
+                mediaType: .audio,
+                position: .unspecified
+            )
+            return !discoverySession.devices.isEmpty
+        }
         
         super.init()
         createTemporaryDirectoryIfNeeded()
@@ -30,46 +44,32 @@ class AudioRecorder: NSObject, ObservableObject {
     }
     
     deinit {
-        if let observer = notificationObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
+        deviceObserverTokens.forEach(notificationCenter.removeObserver)
+        deviceObserverTokens.removeAll()
     }
     
     private func setup() {
         // Check for audio input devices
-        let discoverySession = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.microphone, .external],
-            mediaType: .audio,
-            position: .unspecified
-        )
-        canRecord = !discoverySession.devices.isEmpty
+        canRecord = deviceAvailability()
         
         // Add observer for device connection/disconnection
-        notificationObserver = NotificationCenter.default.addObserver(
+        let connectedToken = notificationCenter.addObserver(
             forName: AVCaptureDevice.wasConnectedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            let session = AVCaptureDevice.DiscoverySession(
-                deviceTypes: [.microphone, .external],
-                mediaType: .audio,
-                position: .unspecified
-            )
-            self?.canRecord = !session.devices.isEmpty
+            self?.canRecord = self?.deviceAvailability() ?? false
         }
+        deviceObserverTokens.append(connectedToken)
         
-        NotificationCenter.default.addObserver(
+        let disconnectedToken = notificationCenter.addObserver(
             forName: AVCaptureDevice.wasDisconnectedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            let session = AVCaptureDevice.DiscoverySession(
-                deviceTypes: [.microphone, .external],
-                mediaType: .audio,
-                position: .unspecified
-            )
-            self?.canRecord = !session.devices.isEmpty
+            self?.canRecord = self?.deviceAvailability() ?? false
         }
+        deviceObserverTokens.append(disconnectedToken)
     }
     
     private func createTemporaryDirectoryIfNeeded() {

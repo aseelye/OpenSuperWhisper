@@ -1,172 +1,241 @@
+import AVFoundation
+import Combine
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
-import AVFoundation
 
+/// Owns the Finder/drop presentation, while admission and terminal lifecycle
+/// remain owned by `DictationSessionController`.
+///
+/// The important boundary here is synchronous: a valid drop reserves a
+/// controller token before loading the `NSItemProvider` or probing its
+/// duration. A second input surface therefore loses at reservation time,
+/// rather than after one of the two operations has already suspended.
 @MainActor
-class FileDropHandler: ObservableObject {
-    static let shared = FileDropHandler()
-    
-    @Published var isDragging = false
-    @Published var isTranscribing = false
-    @Published var fileDuration: TimeInterval = 0
-    @Published var errorMessage: String? = nil
-    
-    private let sessionController: DictationSessionController
-    private var activeDropOperationID: UUID?
-    private var intentionallyCancelledDropOperationIDs = Set<UUID>()
-    private var errorMessageToken: UUID?
-    private let durationLoader: (URL) async throws -> TimeInterval
+final class FileDropHandler: ObservableObject {
+    typealias ProviderLoader = (
+        NSItemProvider,
+        @escaping (Result<URL?, Error>) -> Void
+    ) -> Void
+    typealias ExpiryScheduler = (
+        @escaping () -> Void,
+        TimeInterval
+    ) -> AnyCancellable
 
-    var isLongFile: Bool {
-        fileDuration > 10.0
-    }
+    static let shared = FileDropHandler()
+
+    @Published var isDragging = false
+    @Published private(set) var fileDuration: TimeInterval = 0
+    /// Only errors that happen before a controller reservation are rendered
+    /// here. Once a token exists, the controller is the sole terminal error
+    /// presenter.
+    @Published private(set) var errorMessage: String?
+
+    fileprivate let sessionController: DictationSessionController
+    private let providerLoader: ProviderLoader
+    private let durationLoader: (URL) async throws -> TimeInterval
+    private let expiryScheduler: ExpiryScheduler
+    private var activeToken: SessionOperationToken?
+    private var expiryCancellable: AnyCancellable?
+    private var errorGeneration: UUID?
+    private var controllerCancellable: AnyCancellable?
+
+    /// `isTranscribing` is retained as a presentation spelling for existing
+    /// callers, but its value is derived from token identity rather than
+    /// maintained as a second operation state machine.
+    var isTranscribing: Bool { activeToken != nil }
+
+    var operationToken: SessionOperationToken? { activeToken }
+
+    var isLongFile: Bool { fileDuration > 10 }
 
     init(
         sessionController: DictationSessionController? = nil,
+        providerLoader: ProviderLoader? = nil,
         durationLoader: @escaping (URL) async throws -> TimeInterval = { url in
             let asset = AVURLAsset(url: url)
             let duration = try await asset.load(.duration)
             return CMTimeGetSeconds(duration)
-        }
+        },
+        expiryScheduler: ExpiryScheduler? = nil
     ) {
         self.sessionController = sessionController ?? .shared
+        self.providerLoader = providerLoader ?? Self.defaultProviderLoader
         self.durationLoader = durationLoader
+        self.expiryScheduler = expiryScheduler ?? Self.defaultExpiryScheduler
+
+        controllerCancellable = self.sessionController.objectWillChange.sink {
+            [weak self] _ in
+            self?.objectWillChange.send()
+        }
     }
-    
+
+    deinit {
+        expiryCancellable?.cancel()
+        controllerCancellable?.cancel()
+    }
+
+    /// Presents an admission rejection before any new token is created.
     func showProcessingError() {
-        presentTransientError("Already processing a file. Please wait.", duration: 3)
+        presentLocalError("Already processing an operation. Please wait.", duration: 3)
     }
-    
-    func cancelTranscription() {
-        if let operationID = activeDropOperationID {
-            intentionallyCancelledDropOperationIDs.insert(operationID)
-        }
-        sessionController.cancelRecording()
-        
-        // Reset state
-        isTranscribing = false
-        fileDuration = 0
+
+    /// Requests cancellation through the token that this drop actually
+    /// reserved. The token remains active until controller teardown has
+    /// completed, so a replacement cannot slip in while the UI says
+    /// “Cancelling”.
+    @discardableResult
+    func cancelTranscription() -> Bool {
+        guard let token = activeToken else { return false }
+        return sessionController.cancelRecording(token: token)
     }
-    
+
+    /// Handles one drop. This method is MainActor-isolated, so `reserve` is
+    /// executed synchronously before the first `await`.
     func handleDrop(of providers: [NSItemProvider]) async {
-        guard let provider = providers.first else { return }
-
-        // Double-check we're not already processing
-        if isTranscribing || sessionController.state.isBusy {
-            showProcessingError()
+        guard let provider = providers.first,
+              provider.hasItemConformingToTypeIdentifier(UTType.audio.identifier)
+        else {
+            presentLocalError("Drop an audio file to transcribe.", duration: 4)
             return
         }
 
-        guard provider.hasItemConformingToTypeIdentifier(UTType.audio.identifier) else {
+        guard let token = sessionController.reserve(source: .fileDrop) else {
+            // Admission rejection is intentionally quiet. The winner's
+            // authoritative snapshot already exposes the busy/cancelling
+            // state; a losing drop must not create a second error presenter.
             return
         }
 
-        // Keep this identity alive until every suspended part of the drop has
-        // returned. Cancellation resets the visible state immediately, so a
-        // boolean alone cannot tell a late cancellation from a newer drop.
-        if let activeDropOperationID,
-           !intentionallyCancelledDropOperationIDs.contains(activeDropOperationID) {
-            showProcessingError()
-            return
-        }
-        let operationID = UUID()
-        activeDropOperationID = operationID
-        isTranscribing = true
-        defer { finishDropOperation(operationID) }
+        // Install the identity before any asynchronous provider callback.
+        clearLocalError()
+        activeToken = token
+        fileDuration = 0
+        objectWillChange.send()
+        defer { finish(token: token) }
 
         do {
-            // Create a continuation to handle the non-Sendable NSItemProvider
-            let url = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL?, Error>) in
-                provider.loadItem(forTypeIdentifier: UTType.audio.identifier) { item, error in
-                    if let error = error {
-                        continuation.resume(throwing: error)
-                        return
-                    }
-                    continuation.resume(returning: item as? URL)
+            try await withTaskCancellationHandler(operation: {
+                let loadedURL = try await loadURL(from: provider)
+                guard let url = loadedURL else {
+                    throw FileDropError.itemWasNotAFile
                 }
-            }
+                guard isActive(token) else { return }
 
-            guard let url = url else {
-                print("Error loading item: not a URL")
+                let needsAccess = url.startAccessingSecurityScopedResource()
+                defer {
+                    if needsAccess { url.stopAccessingSecurityScopedResource() }
+                }
+
+                // A duration probe is useful presentation metadata, not a
+                // reason to fail a valid imported file. If it cannot be read,
+                // let the controller continue and derive duration from the
+                // owned audio.
+                let duration = try? await durationLoader(url)
+                guard isActive(token) else { return }
+                fileDuration = duration ?? 0
+
+                // This is the tokenized imported-file API. Any provider/
+                // export/persistence error after this point is presented by
+                // the controller; the drop handler intentionally does not
+                // duplicate that terminal ownership.
+                _ = try await sessionController.transcribeFile(
+                    at: url,
+                    duration: duration,
+                    token: token
+                )
+            }, onCancel: { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self, self.activeToken == token else { return }
+                    _ = self.sessionController.cancelRecording(token: token)
+                }
+            })
+        } catch {
+            guard isActive(token) else { return }
+            if Self.isCancellation(error)
+                || sessionController.snapshot.outcome == .cancelled {
                 return
             }
 
-            guard isDropOperationActive(operationID) else { return }
-
-            let needsAccess = url.startAccessingSecurityScopedResource()
-            defer {
-                if needsAccess {
-                    url.stopAccessingSecurityScopedResource()
-                }
-            }
-
-            print("url: \(url)")
-
-            // Get audio duration
-            let durationInSeconds = try await durationLoader(url)
-
-            guard isDropOperationActive(operationID) else { return }
-
-            self.fileDuration = durationInSeconds
-
-            _ = try await sessionController.transcribeFile(
-                at: url,
-                duration: durationInSeconds
-            )
-        } catch {
-            let wasIntentionalCancellation = intentionallyCancelledDropOperationIDs.contains(operationID)
-            if !(wasIntentionalCancellation && Self.isCancellation(error)) {
-                // This method is MainActor-isolated already. Presenting here
-                // preserves the operation identity instead of scheduling a
-                // task that may run after a new drop has started.
-                present(error: error, for: operationID)
-            }
-            print("Error processing dropped audio file: \(error)")
+            // The provider callback happens after admission but before the
+            // controller can create a file operation. Let the controller
+            // claim and drain this reserved window so it publishes the one
+            // terminal failure and releases the token. A stale callback is
+            // rejected without creating a local banner or cancellation side
+            // effect.
+            _ = await sessionController.failReservedOperation(error, token: token)
         }
     }
 
-    private func finishDropOperation(_ operationID: UUID) {
-        intentionallyCancelledDropOperationIDs.remove(operationID)
-        guard activeDropOperationID == operationID else { return }
-        activeDropOperationID = nil
-        isTranscribing = false
+    private func loadURL(from provider: NSItemProvider) async throws -> URL? {
+        try await withCheckedThrowingContinuation { continuation in
+            providerLoader(provider) { result in
+                continuation.resume(with: result)
+            }
+        }
+    }
+
+    private func isActive(_ token: SessionOperationToken) -> Bool {
+        activeToken == token
+            && sessionController.isReservationActive(token)
+            && sessionController.snapshot.phase != .cancelling
+    }
+
+    private func finish(token: SessionOperationToken) {
+        guard activeToken == token else { return }
+        activeToken = nil
         fileDuration = 0
+        objectWillChange.send()
     }
 
-    private func isDropOperationActive(_ operationID: UUID) -> Bool {
-        activeDropOperationID == operationID
-            && !intentionallyCancelledDropOperationIDs.contains(operationID)
-    }
-
-    private func present(error: Error, for operationID: UUID) {
-        guard activeDropOperationID == operationID else { return }
-        presentTransientError(error.localizedDescription, duration: 5)
-    }
-
-    private func presentTransientError(_ message: String, duration: TimeInterval) {
-        let token = UUID()
-        errorMessageToken = token
+    private func presentLocalError(_ message: String, duration: TimeInterval) {
+        expiryCancellable?.cancel()
+        let generation = UUID()
+        errorGeneration = generation
         errorMessage = message
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
-            guard let self, self.errorMessageToken == token else { return }
+        expiryCancellable = expiryScheduler({ [weak self] in
+            guard let self, self.errorGeneration == generation else { return }
             self.errorMessage = nil
-            self.errorMessageToken = nil
+            self.errorGeneration = nil
+            self.expiryCancellable = nil
+        }, duration)
+    }
+
+    private func clearLocalError() {
+        expiryCancellable?.cancel()
+        expiryCancellable = nil
+        errorGeneration = nil
+        errorMessage = nil
+    }
+
+    private static let defaultProviderLoader: ProviderLoader = { provider, completion in
+        provider.loadItem(forTypeIdentifier: UTType.audio.identifier) { item, error in
+            if let error {
+                completion(.failure(error))
+            } else {
+                completion(.success(item as? URL))
+            }
         }
+    }
+
+    private static let defaultExpiryScheduler: ExpiryScheduler = { callback, duration in
+        let workItem = DispatchWorkItem(block: callback)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + duration,
+            execute: workItem
+        )
+        return AnyCancellable { workItem.cancel() }
     }
 
     private static func isCancellation(_ error: Error) -> Bool {
-        if error is CancellationError {
-            return true
-        }
+        if error is CancellationError { return true }
         if let error = error as? CoreTranscriptionError {
             return error == .cancelled
         }
-        if let error = error as? OpenAITranscriptionEngineError {
+        if let error = error as? AudioCaptureError {
             return error == .cancelled
         }
-        if let error = error as? AudioCaptureError {
+        if let error = error as? TranscriptionLiveInputError {
             return error == .cancelled
         }
         if let error = error as? URLError {
@@ -176,127 +245,123 @@ class FileDropHandler: ObservableObject {
     }
 }
 
-// View modifier for adding drag-and-drop functionality
+private enum FileDropError: LocalizedError {
+    case itemWasNotAFile
+
+    var errorDescription: String? {
+        switch self {
+        case .itemWasNotAFile:
+            return "The dropped item could not be opened as an audio file."
+        }
+    }
+}
+
 struct FileDropOverlay: ViewModifier {
     @ObservedObject private var handler: FileDropHandler
     @ObservedObject private var sessionController: DictationSessionController
 
-    init() {
-        self.handler = FileDropHandler.shared
-        self.sessionController = DictationSessionController.shared
+    init(
+        handler: FileDropHandler? = nil,
+        sessionController: DictationSessionController? = nil
+    ) {
+        let resolvedHandler = handler ?? FileDropHandler.shared
+        self.handler = resolvedHandler
+        self.sessionController = sessionController ?? resolvedHandler.sessionController
     }
-    
+
     func body(content: Content) -> some View {
-        content
+        let snapshot = sessionController.snapshot
+        // The controller snapshot is the only source-of-truth for which
+        // operation owns this overlay. A late drop task may still retain its
+        // local token while a replacement has already been admitted.
+        let ownsDrop = snapshot.presentationOwner == .fileDrop
+
+        return content
             .overlay {
                 if handler.isDragging {
                     ZStack {
-                        Color(NSColor.windowBackgroundColor)
-                            .opacity(0.95)
+                        Color(NSColor.windowBackgroundColor).opacity(0.95)
                         VStack(spacing: 16) {
-                            if handler.isTranscribing {
-                                // Show warning when trying to drop while already processing
-                                Image(systemName: "exclamationmark.triangle")
-                                    .font(.system(size: 48))
-                                    .foregroundColor(.orange)
-                                Text("Please wait until current file is processed")
-                                    .font(.headline)
-                                    .foregroundColor(.orange)
-                            } else {
-                                Image(systemName: "arrow.down.circle")
-                                    .font(.system(size: 48))
-                                    .foregroundColor(.accentColor)
-                                    .symbolEffect(.bounce, value: handler.isDragging)
-                                Text("Drop audio file to transcribe")
-                                    .font(.headline)
-                            }
+                            Image(systemName: "arrow.down.circle")
+                                .font(.system(size: 48))
+                                .foregroundColor(.accentColor)
+                                .symbolEffect(.bounce, value: handler.isDragging)
+                            Text("Drop audio file to transcribe")
+                                .font(.headline)
                         }
                     }
                     .ignoresSafeArea()
                 }
-                
-                // Show transcription status for dropped files
-                if handler.isTranscribing && handler.isLongFile {
+
+                if ownsDrop, let phase = snapshot.phase,
+                   snapshot.isBusy || phase == .cancelling {
                     ZStack {
-                        // Add blur background effect
                         Color(NSColor.windowBackgroundColor)
-                            .opacity(0.7)
+                            .opacity(0.72)
                             .blur(radius: 10)
-                        
-                        VStack(spacing: 16) {
-                            ProgressView()
-                                .frame(width: 200)
-                            
-                            Text("Transcribing audio...")
-                                .foregroundColor(.primary)
+
+                        VStack(spacing: 14) {
+                            DictationProgressView(presentation: .init(snapshot))
+                                .frame(width: 220)
+
+                            Text(DictationSessionPresentation(snapshot).phaseText)
                                 .font(.headline)
-                            
-                            if !sessionController.interimText.isEmpty {
-                                Text(sessionController.interimText)
-                                    .foregroundColor(.primary.opacity(0.8))
+
+                            if !snapshot.interimText.isEmpty {
+                                Text(snapshot.interimText)
+                                    .foregroundColor(.secondary)
                                     .font(.subheadline)
                                     .multilineTextAlignment(.center)
-                                    .frame(maxWidth: 300)
-                                    .lineLimit(2)
+                                    .frame(maxWidth: 320)
+                                    .lineLimit(3)
                             }
-                            
-                            Button(action: {
-                                handler.cancelTranscription()
-                            }) {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "xmark.circle.fill")
-                                    Text("Cancel")
+
+                            if snapshot.canCancel {
+                                Button {
+                                    _ = handler.cancelTranscription()
+                                } label: {
+                                    Label("Cancel", systemImage: "xmark.circle.fill")
                                 }
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 8)
-                                .background(Color.red.opacity(0.8))
-                                .foregroundColor(.white)
-                                .cornerRadius(8)
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                                .accessibilityLabel(snapshot.accessibilityLabel)
+                            } else if phase == .cancelling {
+                                Text("Cancelling…")
+                                    .foregroundColor(.secondary)
+                                    .accessibilityLabel("Cancelling")
                             }
-                            .buttonStyle(PlainButtonStyle())
-                            .padding(.top, 8)
                         }
-                        .padding()
+                        .padding(22)
                         .background(
                             RoundedRectangle(cornerRadius: 12)
                                 .fill(Color(NSColor.controlBackgroundColor))
-                                .shadow(color: Color.black.opacity(0.2), radius: 10)
+                                .shadow(color: .black.opacity(0.2), radius: 10)
                         )
                     }
                     .ignoresSafeArea()
                 }
-                
-                // Show error message if present - now at the top
+
                 if let errorMessage = handler.errorMessage {
                     VStack {
                         Text(errorMessage)
-                            .font(.subheadline.bold())
+                            .font(.subheadline.weight(.semibold))
                             .foregroundColor(.white)
                             .padding()
-                            .background(Color.red.opacity(0.8))
+                            .background(Color.red.opacity(0.88))
                             .cornerRadius(8)
                             .padding(.top, 20)
                             .transition(.move(edge: .top).combined(with: .opacity))
                         Spacer()
                     }
                     .animation(.easeInOut, value: handler.errorMessage != nil)
-                    .zIndex(100) // Ensure it's above other overlays
+                    .zIndex(100)
                 }
             }
             .onDrop(of: [.audio], isTargeted: $handler.isDragging) { providers in
-                // Only process the drop if we're not already transcribing
-                if !handler.isTranscribing {
-                    Task {
-                        await handler.handleDrop(of: providers)
-                    }
-                    return true
-                } else {
-                    // Show error message when trying to drop while processing
-                    handler.showProcessingError()
-                    // Return true to indicate the drop was handled, even though we're ignoring it
-                    // This prevents the OS from trying to handle the drop in other ways
-                    return true
+                Task { @MainActor in
+                    await handler.handleDrop(of: providers)
                 }
+                return true
             }
     }
 }

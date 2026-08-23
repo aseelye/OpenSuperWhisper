@@ -1,43 +1,79 @@
-//
-//  OpenSuperWhisperUITests.swift
-//  OpenSuperWhisperUITests
-//
-//  Created by user on 05.02.2025.
-//
-
+import Foundation
 import XCTest
 
+/// These tests intentionally use the opt-in UI launch mode. They do not
+/// request microphone/accessibility permissions and do not touch the user's
+/// normal defaults or history from the unit-test lane.
 final class OpenSuperWhisperUITests: XCTestCase {
+    private var launchedApps: [XCUIApplication] = []
+    private var isolatedRoots: [URL] = []
 
     override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
-
-        // In UI tests it is usually best to stop immediately when a failure occurs.
         continueAfterFailure = false
-
-        // In UI tests it’s important to set the initial state - such as interface orientation - required for your tests before they run. The setUp method is a good place to do this.
     }
 
     override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
-    }
-
-    @MainActor
-    func testExample() throws {
-        // UI tests must launch the application that they test.
-        let app = XCUIApplication()
-        app.launch()
-
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
-    }
-
-    @MainActor
-    func testLaunchPerformance() throws {
-        if #available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 7.0, *) {
-            // This measures how long it takes to launch your application.
-            measure(metrics: [XCTApplicationLaunchMetric()]) {
-                XCUIApplication().launch()
-            }
+        launchedApps.forEach { app in
+            if app.state != .notRunning { app.terminate() }
         }
+        launchedApps.removeAll()
+        isolatedRoots.forEach { try? FileManager.default.removeItem(at: $0) }
+        isolatedRoots.removeAll()
+    }
+
+    @MainActor
+    func testLaunchShowsMainRecordingSurface() {
+        let app = launchIsolatedApp()
+
+        XCTAssertTrue(app.textFields["Search in transcriptions"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Start recording"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Drop audio file to transcribe"].exists)
+    }
+
+    @MainActor
+    func testHistoryAndRecoverySurfaceHasActionableState() {
+        let app = launchIsolatedApp()
+        XCTAssertTrue(app.textFields["Search in transcriptions"].waitForExistence(timeout: 5))
+
+        let historyState = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS[c] 'history'")
+        )
+        let emptyState = app.staticTexts["No recordings yet"]
+        XCTAssertTrue(historyState.count > 0 || emptyState.waitForExistence(timeout: 3))
+    }
+
+    @MainActor
+    func testWindowCanBeReopenedInFreshLaunchMode() {
+        let app = launchIsolatedApp()
+        XCTAssertTrue(app.buttons["Start recording"].waitForExistence(timeout: 5))
+
+        app.terminate()
+        let reopened = launchIsolatedApp()
+        XCTAssertTrue(reopened.buttons["Start recording"].waitForExistence(timeout: 5))
+    }
+
+    private func launchIsolatedApp() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "--open-super-whisper-ui-test",
+            "-ApplePersistenceIgnoreState",
+            "YES"
+        ]
+        app.launchEnvironment = [
+            "OPEN_SUPER_WHISPER_UI_TEST": "1",
+            "OPEN_SUPER_WHISPER_UI_TEST_ID": UUID().uuidString,
+            "HOME": isolatedRoot().path
+        ]
+        app.launch()
+        launchedApps.append(app)
+        return app
+    }
+
+    private func isolatedRoot() -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenSuperWhisperUITest-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        isolatedRoots.append(root)
+        return root
     }
 }

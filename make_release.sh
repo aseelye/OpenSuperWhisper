@@ -1,236 +1,303 @@
 #!/bin/bash
+# Build a release artifact from the version already committed in project
+# settings. This command never commits, tags, pushes, or calls GitHub.
 set -e
+set -o pipefail
 
-# Configuration
-NEW_VERSION="${1:-0.0.4}"
-CODE_SIGN_IDENTITY="${2}"
-GITHUB_TOKEN="${3}"
+APP_NAME="OpenSuperWhisper"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
+PROJECT_ROOT="$SCRIPT_DIR"
+OUTPUT_DIR=""
+SIGNING_IDENTITY="$RELEASE_SIGNING_IDENTITY"
+NOTARY_PROFILE="$RELEASE_NOTARY_PROFILE"
+DEVELOPMENT_TEAM_VALUE="$RELEASE_DEVELOPMENT_TEAM"
+EXPECTED_VERSION=""
+DRY_RUN=0
 
-if [[ -z "$CODE_SIGN_IDENTITY" ]]; then
-    echo "❌ Error: Code signing identity is required"
-    echo "Usage: $0 <version> <code_sign_identity> [github_token]"
-    echo "Example: $0 0.0.4 \"Developer ID Application: Your Name (TEAM_ID)\" ghp_xxxxx"
+die() {
+    printf 'release error: %s\n' "$*" >&2
     exit 1
-fi
+}
 
-if [[ -z "$GITHUB_TOKEN" ]]; then
-    echo "⚠️ Warning: No GitHub token provided. Will create tag but not GitHub release."
-    echo "To create GitHub release automatically, provide token as 3rd argument."
-fi
+usage() {
+    cat >&2 <<'EOF'
+Usage: make_release.sh [options]
 
-echo "🚀 Making release for OpenSuperWhisper v${NEW_VERSION}"
-echo "   Code signing identity: ${CODE_SIGN_IDENTITY}"
-echo ""
+Build and notarize the committed project version, then write a verified
+artifact manifest. Publishing is a separate operation (publish_release.sh).
 
-# # Update version in Xcode project
-echo "📝 Updating version to ${NEW_VERSION} in Xcode project..."
+Options:
+  --project-root PATH       Repository/project root (default: script directory)
+  --output-dir PATH         Artifact directory (default: build/release)
+  --identity VALUE          Developer ID signing identity
+  --notary-profile VALUE    xcrun notarytool keychain profile
+  --team VALUE              Development team (optional; never hard-coded)
+  --version VALUE           Assert this version; never modify project settings
+  --dry-run                 Run preflight only; no build or filesystem mutation
+  --help                    Show this help
 
-# Update MARKETING_VERSION in project.pbxproj
-sed -i '' "s/MARKETING_VERSION = [^;]*/MARKETING_VERSION = ${NEW_VERSION}/g" OpenSuperWhisper.xcodeproj/project.pbxproj
-
-# Get current PROJECT_VERSION and increment by 1
-CURRENT_PROJECT_VERSION=$(grep -o 'CURRENT_PROJECT_VERSION = [0-9]*' OpenSuperWhisper.xcodeproj/project.pbxproj | head -1 | grep -o '[0-9]*')
-NEW_PROJECT_VERSION=$((CURRENT_PROJECT_VERSION + 1))
-sed -i '' "s/CURRENT_PROJECT_VERSION = [^;]*/CURRENT_PROJECT_VERSION = ${NEW_PROJECT_VERSION}/g" OpenSuperWhisper.xcodeproj/project.pbxproj
-
-echo "✅ Updated MARKETING_VERSION to ${NEW_VERSION} and CURRENT_PROJECT_VERSION to ${NEW_PROJECT_VERSION} (was ${CURRENT_PROJECT_VERSION})"
-
-# Clean previous builds
-echo "🧹 Cleaning previous builds..."
-rm -rf build
-rm -f OpenSuperWhisper.dmg
-rm -f OpenSuperWhisper.dmg.sha256
-rm -f OpenSuperWhisper.app.dSYM.zip
-
-# Use the existing notarize_app.sh script to build, sign, and notarize
-echo "🔨 Building, signing and notarizing with notarize_app.sh..."
-if [[ ! -f "./notarize_app.sh" ]]; then
-    echo "❌ notarize_app.sh not found!"
-    exit 1
-fi
-
-chmod +x ./notarize_app.sh
-./notarize_app.sh "${CODE_SIGN_IDENTITY}"
-
-if [[ $? -ne 0 ]]; then
-    echo "❌ Build/notarization failed!"
-    exit 1
-fi
-
-echo "✅ Build and notarization successful!"
-
-DMG_PATH="./OpenSuperWhisper.dmg"
-
-# Verify DMG exists
-if [[ ! -f "$DMG_PATH" ]]; then
-    echo "❌ DMG not found at $DMG_PATH"
-    exit 1
-fi
-
-# Find and prepare dSYM
-DSYM_PATH="./build/Build/Products/Release/OpenSuperWhisper.app.dSYM"
-DSYM_ZIP_PATH="./OpenSuperWhisper.app.dSYM.zip"
-
-if [[ -d "$DSYM_PATH" ]]; then
-    echo "📦 Creating dSYM zip..."
-    cd $(dirname "$DSYM_PATH")
-    zip -r "$(basename "$DSYM_ZIP_PATH")" "$(basename "$DSYM_PATH")" > /dev/null
-    mv "$(basename "$DSYM_ZIP_PATH")" "$DSYM_ZIP_PATH"
-    cd - > /dev/null
-    echo "✅ dSYM zip created: $DSYM_ZIP_PATH"
-else
-    echo "⚠️ dSYM not found at $DSYM_PATH - skipping dSYM upload"
-    DSYM_ZIP_PATH=""
-fi
-
-# # Generate SHA256
-echo "🔍 Generating SHA256..."
-shasum -a 256 "$DMG_PATH" > "${DMG_PATH}.sha256"
-SHA256=$(cat "${DMG_PATH}.sha256" | cut -d' ' -f1)
-echo "SHA256: $SHA256"
-
-# # Commit version changes
-echo "📝 Committing version changes..."
-git add OpenSuperWhisper.xcodeproj/project.pbxproj
-git commit -m "Bump version to ${NEW_VERSION}" || echo "No changes to commit"
-
-# Create git tag
-echo "🏷️ Creating git tag..."
-git tag -a "${NEW_VERSION}" -m "Release ${NEW_VERSION}"
-
-# Push tag to origin
-echo "📤 Pushing tag to origin..."
-git push origin "${NEW_VERSION}"
-
-if [[ $? -ne 0 ]]; then
-    echo "❌ Failed to push tag!"
-    exit 1
-fi
-
-# Create GitHub release and upload DMG if token is provided
-if [[ -n "$GITHUB_TOKEN" ]]; then
-    echo "🚀 Creating GitHub release..."
-    
-    # Create release
-    RELEASE_RESPONSE=$(curl -s -L -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        https://api.github.com/repos/Starmel/OpenSuperWhisper/releases \
-        -d '{
-            "tag_name": "'${NEW_VERSION}'",
-            "target_commitish": "master",
-            "name": "Release '${NEW_VERSION}'",
-            "body": "## OpenSuperWhisper '${NEW_VERSION}'\n\nPrivate, on-device transcription with Apple's Speech framework, plus optional post-recording uploads through OpenAI's gpt-transcribe model.\n\n## Installation\n\n### Homebrew (Recommended)\n```bash\nbrew update\nbrew install opensuperwhisper\n```\n\n### Manual Installation\n1. Download the `OpenSuperWhisper.dmg` file below\n2. Open the DMG and drag OpenSuperWhisper to Applications\n3. Launch the app and grant necessary permissions\n\n## Requirements\n- macOS 26 or later\n- Apple Silicon (ARM64) Mac",
-            "draft": false,
-            "prerelease": false,
-            "generate_release_notes": false
-        }')
-    
-    # Extract release ID from response
-    RELEASE_ID=$(echo "$RELEASE_RESPONSE" | grep -o '"id": [0-9]*' | head -1 | grep -o '[0-9]*')
-    
-    if [[ -z "$RELEASE_ID" ]]; then
-        echo "❌ Failed to create GitHub release or extract release ID"
-        echo "Response: $RELEASE_RESPONSE"
-        exit 1
-    fi
-    
-    echo "✅ GitHub release created (ID: $RELEASE_ID)!"
-    echo "📤 Uploading DMG..."
-    
-    # Upload DMG using the correct API format
-    UPLOAD_RESPONSE=$(curl -s -L -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        -H "Content-Type: application/octet-stream" \
-        "https://uploads.github.com/repos/Starmel/OpenSuperWhisper/releases/${RELEASE_ID}/assets?name=OpenSuperWhisper.dmg" \
-        --data-binary @"${DMG_PATH}")
-    
-    # Check if upload was successful
-    if [[ $(echo "$UPLOAD_RESPONSE" | grep -c '"state":"uploaded"') -gt 0 ]] || [[ $(echo "$UPLOAD_RESPONSE" | grep -c '"state": "uploaded"') -gt 0 ]]; then
-        echo "✅ DMG uploaded successfully!"
-        # Extract download URL
-        DOWNLOAD_URL=$(echo "$UPLOAD_RESPONSE" | grep -o '"browser_download_url":"[^"]*' | cut -d'"' -f4)
-        echo "📥 Download URL: $DOWNLOAD_URL"
-    elif [[ $(echo "$UPLOAD_RESPONSE" | grep -c '"message"') -gt 0 ]]; then
-        echo "❌ Failed to upload DMG"
-        echo "Error: $(echo "$UPLOAD_RESPONSE" | grep -o '"message":"[^"]*' | cut -d'"' -f4)"
-        exit 1
-    else
-        echo "⚠️ Upload response unclear, but no error detected"
-        echo "Response: $UPLOAD_RESPONSE"
-    fi
-    
-    # Upload dSYM if available
-    if [[ -n "$DSYM_ZIP_PATH" && -f "$DSYM_ZIP_PATH" ]]; then
-        echo "📤 Uploading dSYM..."
-        
-        DSYM_UPLOAD_RESPONSE=$(curl -s -L -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "Content-Type: application/zip" \
-            "https://uploads.github.com/repos/Starmel/OpenSuperWhisper/releases/${RELEASE_ID}/assets?name=OpenSuperWhisper.app.dSYM.zip" \
-            --data-binary @"${DSYM_ZIP_PATH}")
-        
-        # Check dSYM upload
-        if [[ $(echo "$DSYM_UPLOAD_RESPONSE" | grep -c '"state":"uploaded"') -gt 0 ]] || [[ $(echo "$DSYM_UPLOAD_RESPONSE" | grep -c '"state": "uploaded"') -gt 0 ]]; then
-            echo "✅ dSYM uploaded successfully!"
-            # Extract download URL
-            DSYM_DOWNLOAD_URL=$(echo "$DSYM_UPLOAD_RESPONSE" | grep -o '"browser_download_url":"[^"]*' | cut -d'"' -f4)
-            echo "📥 dSYM Download URL: $DSYM_DOWNLOAD_URL"
-        elif [[ $(echo "$DSYM_UPLOAD_RESPONSE" | grep -c '"message"') -gt 0 ]]; then
-            echo "⚠️ Failed to upload dSYM (non-critical)"
-            echo "Error: $(echo "$DSYM_UPLOAD_RESPONSE" | grep -o '"message":"[^"]*' | cut -d'"' -f4)"
-        else
-            echo "⚠️ dSYM upload response unclear"
-        fi
-    fi
-    
-    echo "✅ DMG uploaded successfully!"
-    echo "🎉 GitHub release is complete!"
-    echo "🔗 Release URL: https://github.com/Starmel/OpenSuperWhisper/releases/tag/${NEW_VERSION}"
-else
-    echo "⚠️ Skipping GitHub release creation (no token provided)"
-    echo "📋 Manual steps needed:"
-    echo "1. Create GitHub release at:"
-    echo "   https://github.com/Starmel/OpenSuperWhisper/releases/new?tag=${NEW_VERSION}"
-    echo "2. Upload the DMG file: OpenSuperWhisper.dmg"
-fi
-
-echo ""
-echo "🎉 Release ${NEW_VERSION} is ready!"
-echo ""
-echo "📁 Files created:"
-echo "   - OpenSuperWhisper.dmg"
-echo "   - OpenSuperWhisper.dmg.sha256"
-if [[ -f "$DSYM_ZIP_PATH" ]]; then
-    echo "   - OpenSuperWhisper.app.dSYM.zip"
-fi
-echo ""
-echo "🍺 Homebrew cask update:"
-echo "-----"
-cat << EOF
-cask "opensuperwhisper" do
-  version "${NEW_VERSION}"
-  sha256 "${SHA256}"
-
-  url "https://github.com/starmel/OpenSuperWhisper/releases/download/#{version}/OpenSuperWhisper.dmg"
-  name "OpenSuperWhisper"
-  desc "Private Apple Speech and optional gpt-transcribe dictation app"
-  homepage "https://github.com/starmel/OpenSuperWhisper"
-
-  depends_on macos: ">= :tahoe"
-  depends_on arch: :arm64
-
-  app "OpenSuperWhisper.app"
-
-  zap trash: [
-    "~/Library/Application Scripts/ru.starmel.OpenSuperWhisper",
-    "~/Library/Application Support/ru.starmel.OpenSuperWhisper",
-  ]
-end
+Signing inputs can also be supplied with RELEASE_SIGNING_IDENTITY,
+RELEASE_NOTARY_PROFILE, and RELEASE_DEVELOPMENT_TEAM. GitHub credentials are
+not read by this command and are never accepted as positional arguments.
 EOF
-echo "-----"
+    exit 2
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+require_tool() {
+    command_exists "$1" || die "required tool not found: $1"
+}
+
+absolute_from_root() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$PROJECT_ROOT" "$1" ;;
+    esac
+}
+
+assert_safe_child() {
+    candidate="$1"
+    label="$2"
+    case "$candidate" in
+        "$PROJECT_ROOT"/*) ;;
+        *) die "$label must be inside project root: $candidate" ;;
+    esac
+    [ "$candidate" != "$PROJECT_ROOT" ] || die "$label may not be the project root"
+    case "$candidate" in
+        *"/../"*|*/..|*/./*|*/.) die "$label contains an unsafe path: $candidate" ;;
+    esac
+}
+
+assert_not_symlink() {
+    [ ! -L "$1" ] || die "refusing symlink path: $1"
+}
+
+project_version() {
+    awk '
+        /MARKETING_VERSION[[:space:]]*=/ {
+            value=$0
+            sub(/^.*MARKETING_VERSION[[:space:]]*=[[:space:]]*/, "", value)
+            sub(/[;[:space:]].*$/, "", value)
+            if (value != "") print value
+        }
+    ' "$1" | sort -u
+}
+
+project_build_number() {
+    awk '
+        /CURRENT_PROJECT_VERSION[[:space:]]*=/ {
+            value=$0
+            sub(/^.*CURRENT_PROJECT_VERSION[[:space:]]*=[[:space:]]*/, "", value)
+            sub(/[;[:space:]].*$/, "", value)
+            if (value != "") print value
+        }
+    ' "$1" | sort -u | head -n 1
+}
+
+validate_version() {
+    case "$1" in
+        ""|*[!0-9A-Za-z.+-]*) die "invalid MARKETING_VERSION: $1" ;;
+    esac
+    case "$1" in
+        *.*.*) ;;
+        *) die "MARKETING_VERSION must contain major, minor, and patch components: $1" ;;
+    esac
+}
+
+verify_identity() {
+    [ -n "$SIGNING_IDENTITY" ] || die "signing identity is required (--identity or RELEASE_SIGNING_IDENTITY)"
+    case "$SIGNING_IDENTITY" in
+        *$'\n'*|*$'\r'*) die "signing identity contains a line break" ;;
+    esac
+    security_output=$(security find-identity -v -p codesigning 2>/dev/null) || die "unable to inspect code-signing identities"
+    printf '%s\n' "$security_output" | grep -F -- "$SIGNING_IDENTITY" >/dev/null 2>&1 || die "signing identity is not available in the keychain"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --project-root)
+            [ "$#" -ge 2 ] || usage
+            PROJECT_ROOT="$2"
+            shift 2
+            ;;
+        --output-dir)
+            [ "$#" -ge 2 ] || usage
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --identity|--signing-identity)
+            [ "$#" -ge 2 ] || usage
+            SIGNING_IDENTITY="$2"
+            shift 2
+            ;;
+        --notary-profile)
+            [ "$#" -ge 2 ] || usage
+            NOTARY_PROFILE="$2"
+            shift 2
+            ;;
+        --team)
+            [ "$#" -ge 2 ] || usage
+            DEVELOPMENT_TEAM_VALUE="$2"
+            shift 2
+            ;;
+        --version)
+            [ "$#" -ge 2 ] || usage
+            EXPECTED_VERSION="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --help|-h)
+            usage
+            ;;
+        --*)
+            die "unknown option: $1"
+            ;;
+        *)
+            die "positional arguments are not accepted; use explicit options"
+            ;;
+    esac
+done
+
+PROJECT_ROOT=$(CDPATH= cd -- "$PROJECT_ROOT" 2>/dev/null && pwd -P) || die "project root does not exist"
+if [ -z "$OUTPUT_DIR" ]; then
+    OUTPUT_DIR="$PROJECT_ROOT/build/release"
+else
+    OUTPUT_DIR=$(absolute_from_root "$OUTPUT_DIR")
+fi
+assert_safe_child "$OUTPUT_DIR" "artifact directory"
+assert_not_symlink "$OUTPUT_DIR"
+
+PROJECT_FILE="$PROJECT_ROOT/OpenSuperWhisper.xcodeproj/project.pbxproj"
+[ -f "$PROJECT_FILE" ] || die "Xcode project settings not found: $PROJECT_FILE"
+PROJECT_FILE_REL=${PROJECT_FILE#"$PROJECT_ROOT"/}
+
+require_tool git
+REPO_ROOT=$(git -C "$PROJECT_ROOT" rev-parse --show-toplevel 2>/dev/null) || die "project root is not a Git repository"
+REPO_ROOT=$(CDPATH= cd -- "$REPO_ROOT" && pwd -P)
+[ "$REPO_ROOT" = "$PROJECT_ROOT" ] || die "project root must be the Git repository root"
+HEAD_COMMIT=$(git -C "$PROJECT_ROOT" rev-parse --verify HEAD 2>/dev/null) || die "repository has no commit"
+if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=all)" ]; then
+    die "repository is dirty; commit project changes before building"
+fi
+
+VERSION_VALUES=$(project_version "$PROJECT_FILE")
+[ -n "$VERSION_VALUES" ] || die "MARKETING_VERSION is missing from project settings"
+VERSION_COUNT=$(printf '%s\n' "$VERSION_VALUES" | grep -c .)
+[ "$VERSION_COUNT" -eq 1 ] || die "project settings contain multiple MARKETING_VERSION values"
+VERSION=$(printf '%s\n' "$VERSION_VALUES" | head -n 1)
+validate_version "$VERSION"
+if [ -n "$EXPECTED_VERSION" ] && [ "$EXPECTED_VERSION" != "$VERSION" ]; then
+    die "requested version $EXPECTED_VERSION does not match committed project version $VERSION"
+fi
+
+HEAD_VERSION=$(git -C "$PROJECT_ROOT" show "HEAD:$PROJECT_FILE_REL" 2>/dev/null | project_version /dev/stdin)
+[ "$HEAD_VERSION" = "$VERSION" ] || die "working project version is not the committed HEAD version"
+BUILD_NUMBER=$(project_build_number "$PROJECT_FILE")
+[ -n "$BUILD_NUMBER" ] || die "CURRENT_PROJECT_VERSION is missing from project settings"
+
+if [ -n "$DEVELOPMENT_TEAM_VALUE" ]; then
+    case "$DEVELOPMENT_TEAM_VALUE" in
+        *[!A-Za-z0-9]*) die "development team contains unsupported characters" ;;
+    esac
+fi
+
+NOTARIZE_SCRIPT="$SCRIPT_DIR/notarize_app.sh"
+[ -f "$NOTARIZE_SCRIPT" ] || die "notarize_app.sh not found beside make_release.sh"
+
+for tool in awk sort head grep git shasum codesign xcrun security bash xcodebuild zip swifty-dmg; do
+    require_tool "$tool"
+done
+verify_identity
+[ -n "$NOTARY_PROFILE" ] || die "notary profile is required (--notary-profile or RELEASE_NOTARY_PROFILE)"
+
+DMG_PATH="$OUTPUT_DIR/$APP_NAME.dmg"
+DMG_SHA_PATH="$OUTPUT_DIR/$APP_NAME.dmg.sha256"
+DSYM_ZIP_PATH="$OUTPUT_DIR/$APP_NAME.app.dSYM.zip"
+MANIFEST_PATH="$OUTPUT_DIR/release-manifest.txt"
+
+printf 'Release preflight OK for %s (commit %.12s, build %s).\n' "$VERSION" "$HEAD_COMMIT" "$BUILD_NUMBER"
+printf '  artifact directory: %s\n' "$OUTPUT_DIR"
+if [ -n "$SIGNING_IDENTITY" ]; then
+    printf '  signing identity: provided\n'
+else
+    printf '  signing identity: missing (dry-run only)\n'
+fi
+if [ -n "$NOTARY_PROFILE" ]; then
+    printf '  notary profile: provided\n'
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRY RUN: no build, cleanup, manifest, Git, or network mutation will occur.\n'
+    exit 0
+fi
+
+NOTARIZE_ARGS=(
+    --project-root "$PROJECT_ROOT"
+    --output-dir "$OUTPUT_DIR"
+    --identity "$SIGNING_IDENTITY"
+    --notary-profile "$NOTARY_PROFILE"
+)
+if [ -n "$DEVELOPMENT_TEAM_VALUE" ]; then
+    NOTARIZE_ARGS+=(--team "$DEVELOPMENT_TEAM_VALUE")
+fi
+bash "$NOTARIZE_SCRIPT" "${NOTARIZE_ARGS[@]}"
+
+[ -f "$DMG_PATH" ] || die "DMG not found after notarization: $DMG_PATH"
+[ -f "$DMG_SHA_PATH" ] || die "DMG checksum not found after notarization: $DMG_SHA_PATH"
+codesign --verify --deep --strict "$DMG_PATH" >/dev/null 2>&1 || die "DMG signature verification failed"
+xcrun stapler validate "$DMG_PATH" >/dev/null 2>&1 || die "DMG notarization validation failed"
+
+EXPECTED_SHA=$(awk '{print $1; exit}' "$DMG_SHA_PATH")
+case "$EXPECTED_SHA" in
+    ''|*[!0-9A-Fa-f]*) die "invalid DMG checksum file: $DMG_SHA_PATH" ;;
+esac
+[ ${#EXPECTED_SHA} -eq 64 ] || die "DMG checksum is not SHA-256: $DMG_SHA_PATH"
+ACTUAL_SHA=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
+[ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || die "DMG checksum does not match artifact"
+if [ -f "$DSYM_ZIP_PATH" ]; then
+    DSYM_REL=${DSYM_ZIP_PATH#"$PROJECT_ROOT"/}
+    DSYM_SHA=$(shasum -a 256 "$DSYM_ZIP_PATH" | awk '{print $1}')
+else
+    DSYM_REL="none"
+    DSYM_SHA="none"
+fi
+
+FINAL_HEAD=$(git -C "$PROJECT_ROOT" rev-parse --verify HEAD 2>/dev/null) || die "repository HEAD disappeared"
+[ "$FINAL_HEAD" = "$HEAD_COMMIT" ] || die "repository HEAD changed during build"
+if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=all)" ]; then
+    die "build changed tracked or untracked repository state"
+fi
+FINAL_VERSION=$(project_version "$PROJECT_FILE")
+[ "$FINAL_VERSION" = "$VERSION" ] || die "project version changed during build"
+
+DMG_REL=${DMG_PATH#"$PROJECT_ROOT"/}
+DMG_SHA_REL=${DMG_SHA_PATH#"$PROJECT_ROOT"/}
+REPOSITORY_URL=$(git -C "$PROJECT_ROOT" config --get remote.origin.url 2>/dev/null || true)
+MANIFEST_TMP="$MANIFEST_PATH.tmp.$$"
+trap 'rm -f "$MANIFEST_TMP"' EXIT HUP INT TERM
+umask 077
+{
+    printf 'MANIFEST_FORMAT=1\n'
+    printf 'APP_NAME=%s\n' "$APP_NAME"
+    printf 'VERSION=%s\n' "$VERSION"
+    printf 'MARKETING_VERSION=%s\n' "$VERSION"
+    printf 'CURRENT_PROJECT_VERSION=%s\n' "$BUILD_NUMBER"
+    printf 'SOURCE_COMMIT=%s\n' "$HEAD_COMMIT"
+    printf 'TAG=%s\n' "$VERSION"
+    printf 'ORIGIN_URL=%s\n' "$REPOSITORY_URL"
+    printf 'DMG=%s\n' "$DMG_REL"
+    printf 'DMG_SHA256=%s\n' "$ACTUAL_SHA"
+    printf 'DSYM=%s\n' "$DSYM_REL"
+    printf 'DSYM_SHA256=%s\n' "$DSYM_SHA"
+    printf 'NOTARIZATION=stapled\n'
+} >"$MANIFEST_TMP"
+mv -f "$MANIFEST_TMP" "$MANIFEST_PATH"
+trap - EXIT HUP INT TERM
+
+printf 'Verified release artifacts written to %s.\n' "$MANIFEST_PATH"

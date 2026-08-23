@@ -74,6 +74,74 @@ public protocol OpenAITranscriptionChunker: Sendable {
     ) async throws -> [OpenAIAudioChunk]?
 }
 
+/// Narrow filesystem seam used only for temporary artifact cleanup. Keeping
+/// it separate from the chunker makes cleanup failures deterministic in unit
+/// tests without replacing URLSession or AVFoundation.
+public protocol OpenAITranscriptionFileSystem: Sendable {
+    func removeItem(at url: URL) throws
+}
+
+public struct DefaultOpenAITranscriptionFileSystem: OpenAITranscriptionFileSystem {
+    public init() {}
+
+    public func removeItem(at url: URL) throws {
+        try FileManager.default.removeItem(at: url)
+    }
+}
+
+/// Media-export seam for the AVFoundation chunker. The production exporter
+/// uses AVAssetExportSession; tests can return deterministic files (including
+/// an intentionally oversized first export) without relying on a codec.
+public protocol OpenAITranscriptionChunkExporter: Sendable {
+    func export(
+        fileURL: URL,
+        start: TimeInterval,
+        duration: TimeInterval,
+        outputURL: URL,
+        fileLengthLimit: Int
+    ) async throws
+}
+
+public final class AVFoundationOpenAITranscriptionChunkExporter: @unchecked Sendable, OpenAITranscriptionChunkExporter {
+    public init() {}
+
+    public func export(
+        fileURL: URL,
+        start: TimeInterval,
+        duration: TimeInterval,
+        outputURL: URL,
+        fileLengthLimit: Int
+    ) async throws {
+        let asset = AVURLAsset(url: fileURL)
+        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            throw OpenAITranscriptionEngineError.chunkingFailed("The M4A export session could not be created.")
+        }
+        let assetDuration = try await asset.load(.duration)
+        let timescale: CMTimeScale = assetDuration.timescale == 0 ? 600 : assetDuration.timescale
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .m4a
+        exportSession.shouldOptimizeForNetworkUse = true
+        exportSession.timeRange = CMTimeRange(
+            start: CMTime(seconds: start, preferredTimescale: timescale),
+            duration: CMTime(seconds: duration, preferredTimescale: timescale)
+        )
+        exportSession.fileLengthLimit = Int64(fileLengthLimit)
+        let box = AVFoundationOpenAITranscriptionChunker.ExportSessionBox(exportSession)
+        do {
+            try await withTaskCancellationHandler(operation: {
+                try await box.value.export(to: outputURL, as: .m4a)
+            }, onCancel: {
+                box.value.cancelExport()
+            })
+        } catch is CancellationError {
+            throw OpenAITranscriptionEngineError.cancelled
+        } catch {
+            if Task.isCancelled { throw OpenAITranscriptionEngineError.cancelled }
+            throw error
+        }
+    }
+}
+
 /// Settings specific to the OpenAI file-upload backend. The 24 MiB ceiling
 /// deliberately leaves one MiB below the API's documented 25 MB limit.
 public struct OpenAITranscriptionConfiguration: Sendable {
@@ -110,17 +178,19 @@ public struct OpenAITranscriptionConfiguration: Sendable {
 /// OpenAI's completed-file transcription implementation. It intentionally
 /// does not open a realtime session: the selected gpt-transcribe workflow is
 /// an upload made after capture has stopped.
-public final class OpenAITranscriptionEngine: @unchecked Sendable, TranscriptionEngine {
+public final class OpenAITranscriptionEngine: @unchecked Sendable, TranscriptionEngine, TranscriptionProvider {
     public static let model = "gpt-transcribe"
+    public let strategy: RecordingTranscriptionStrategy = .fileAfterCapture
 
     private let session: URLSession
     private let apiKeyLoader: @Sendable () throws -> String?
     private let chunker: any OpenAITranscriptionChunker
     private let configuration: OpenAITranscriptionConfiguration
     private let sleep: @Sendable (UInt64) async throws -> Void
-    private let stateLock = NSLock()
-    private var activeRequest: Task<(Data, URLResponse), Error>?
-    private var cancelled = false
+    fileprivate let fileSystem: any OpenAITranscriptionFileSystem
+    fileprivate let diagnosticSink: any TranscriptionDiagnosticSink
+    private let operationLock = NSLock()
+    private weak var activeOperation: OpenAIFileTranscriptionOperation?
 
     init(
         session: URLSession? = nil,
@@ -131,7 +201,9 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
         configuration: OpenAITranscriptionConfiguration = .init(),
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { nanoseconds in
             try await Task.sleep(nanoseconds: nanoseconds)
-        }
+        },
+        fileSystem: any OpenAITranscriptionFileSystem = DefaultOpenAITranscriptionFileSystem(),
+        diagnosticSink: any TranscriptionDiagnosticSink = LoggerTranscriptionDiagnosticSink.shared
     ) {
         if let session {
             self.session = session
@@ -145,11 +217,38 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
         self.chunker = chunker
         self.configuration = configuration
         self.sleep = sleep
+        self.fileSystem = fileSystem
+        self.diagnosticSink = diagnosticSink
     }
 
     /// Convenience initializer useful for integration tests and command-line
     /// callers that already have a key. The app uses the Keychain-backed
     /// initializer above.
+    convenience init(
+        apiKey: String,
+        session: URLSession? = nil,
+        chunker: any OpenAITranscriptionChunker = AVFoundationOpenAITranscriptionChunker(),
+        configuration: OpenAITranscriptionConfiguration = .init(),
+        sleep: @escaping @Sendable (UInt64) async throws -> Void = { nanoseconds in
+            try await Task.sleep(nanoseconds: nanoseconds)
+        },
+        fileSystem: any OpenAITranscriptionFileSystem = DefaultOpenAITranscriptionFileSystem(),
+        diagnosticSink: any TranscriptionDiagnosticSink = LoggerTranscriptionDiagnosticSink.shared
+    ) {
+        self.init(
+            session: session,
+            apiKeyLoader: { apiKey },
+            chunker: chunker,
+            configuration: configuration,
+            sleep: sleep,
+            fileSystem: fileSystem,
+            diagnosticSink: diagnosticSink
+        )
+    }
+
+    /// Public production initializer. Diagnostic and filesystem seams remain
+    /// internal because they use app-private sink types; @testable provider
+    /// tests use the designated initializer above when they need injection.
     public convenience init(
         apiKey: String,
         session: URLSession? = nil,
@@ -164,15 +263,49 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
             apiKeyLoader: { apiKey },
             chunker: chunker,
             configuration: configuration,
-            sleep: sleep
+            sleep: sleep,
+            fileSystem: DefaultOpenAITranscriptionFileSystem(),
+            diagnosticSink: LoggerTranscriptionDiagnosticSink.shared
         )
     }
 
+    /// Synchronous provider factory. It only captures immutable operation
+    /// configuration; Keychain, export, retry, and network work begin in
+    /// `value()`.
+    public func makeFileOperation(
+        at url: URL,
+        locale: Locale,
+        context: String?,
+        expectedTerms: [String]
+    ) throws -> any TranscriptionFileOperation {
+        OpenAIFileTranscriptionOperation(
+            session: session,
+            apiKeyLoader: apiKeyLoader,
+            chunker: chunker,
+            configuration: configuration,
+            sleep: sleep,
+            fileSystem: fileSystem,
+            diagnosticSink: diagnosticSink,
+            fileURL: url,
+            locale: locale,
+            context: context,
+            expectedTerms: expectedTerms
+        )
+    }
+
+    public func makeLiveOperation(
+        locale: Locale,
+        context: String?,
+        expectedTerms: [String]
+    ) throws -> (any TranscriptionLiveOperation)? {
+        _ = (locale, context, expectedTerms)
+        return nil
+    }
+
     public func prepare(locale: Locale) async throws {
-        try checkCancellation()
         // There is no model or language asset to download for OpenAI. Keeping
-        // preparation as a cancellation-aware no-op lets the controller use
-        // the same lifecycle for local and cloud engines.
+        // preparation as a no-op lets the controller use the same lifecycle
+        // for local and cloud engines.
         _ = locale
     }
 
@@ -191,305 +324,29 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
         context: String?,
         expectedTerms: [String]
     ) async throws -> Transcript {
-        beginOperation()
-
-        do {
-            try checkCancellation()
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                throw OpenAITranscriptionEngineError.invalidAudioFile(url.lastPathComponent)
-            }
-
-            let apiKey = try loadAPIKey()
-            let prompt = Self.sanitizePrompt(context)
-            let keywords = Self.sanitizeKeywords(expectedTerms)
-            let language = Self.normalizedLanguageIdentifier(locale.identifier)
-
-            let chunks = try await chunker.makeChunks(
-                for: url,
-                safetyLimitBytes: configuration.uploadSafetyLimitBytes,
-                maximumChunkDuration: configuration.maximumChunkDuration,
-                overlap: configuration.chunkOverlap
-            )
-
-            let result: String
-            if let chunks, !chunks.isEmpty {
-                result = try await transcribeChunks(
-                    chunks,
-                    locale: language,
-                    prompt: prompt,
-                    keywords: keywords,
-                    apiKey: apiKey
-                )
-            } else {
-                let fileSize = try fileSize(of: url)
-                guard fileSize <= configuration.uploadSafetyLimitBytes else {
-                    throw OpenAITranscriptionEngineError.fileTooLarge(
-                        limitBytes: configuration.uploadSafetyLimitBytes
-                    )
-                }
-                result = try await transcribeFileWithRetries(
-                    url,
-                    locale: language,
-                    prompt: prompt,
-                    keywords: keywords,
-                    apiKey: apiKey
-                )
-            }
-
-            try checkCancellation()
-            return Transcript(text: Self.cleanTranscript(result), locale: locale, segments: [])
-        } catch is CancellationError {
-            throw OpenAITranscriptionEngineError.cancelled
-        } catch let error as URLError where error.code == .cancelled {
-            throw OpenAITranscriptionEngineError.cancelled
-        } catch let error as OpenAITranscriptionEngineError {
-            if case let .network(urlError) = error, urlError.code == .cancelled {
-                throw OpenAITranscriptionEngineError.cancelled
-            }
-            throw error
-        } catch {
-            if isCancelled() || Task.isCancelled {
-                throw OpenAITranscriptionEngineError.cancelled
-            }
-            throw error
+        let operation = try makeFileOperation(
+            at: url,
+            locale: locale,
+            context: context,
+            expectedTerms: expectedTerms
+        )
+        guard let concrete = operation as? OpenAIFileTranscriptionOperation else {
+            return try await operation.value()
         }
+        operationLock.withLock { activeOperation = concrete }
+        defer {
+            operationLock.withLock {
+                if activeOperation === concrete { activeOperation = nil }
+            }
+        }
+        return try await concrete.value()
     }
 
     /// Cancels the active upload. URLSession also observes cancellation of the
     /// caller's task, so both controller-driven and task-driven cancellation
     /// stop network work promptly.
     public func cancel() {
-        let request = withStateLock {
-            cancelled = true
-            return activeRequest
-        }
-        request?.cancel()
-    }
-
-    // MARK: - Request lifecycle
-
-    private func beginOperation() {
-        withStateLock {
-            cancelled = false
-            activeRequest = nil
-        }
-    }
-
-    private func checkCancellation() throws {
-        if Task.isCancelled || isCancelled() {
-            throw OpenAITranscriptionEngineError.cancelled
-        }
-    }
-
-    private func isCancelled() -> Bool {
-        withStateLock { cancelled }
-    }
-
-    private func loadAPIKey() throws -> String {
-        let key: String?
-        do {
-            key = try apiKeyLoader()
-        } catch {
-            throw OpenAITranscriptionEngineError.keychainFailure(error.localizedDescription)
-        }
-
-        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !trimmed.isEmpty else {
-            throw OpenAITranscriptionEngineError.missingAPIKey
-        }
-        return trimmed
-    }
-
-    private func fileSize(of url: URL) throws -> Int {
-        do {
-            return try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-        } catch {
-            throw OpenAITranscriptionEngineError.invalidAudioFile(url.lastPathComponent)
-        }
-    }
-
-    private func transcribeChunks(
-        _ chunks: [OpenAIAudioChunk],
-        locale: String?,
-        prompt: String?,
-        keywords: [String],
-        apiKey: String
-    ) async throws -> String {
-        var combined = ""
-        let temporaryFiles = chunks.filter(\.isTemporary).map(\.fileURL)
-        let cleanupDirectories = Set(chunks.compactMap(\.cleanupDirectory))
-
-        defer {
-            for fileURL in temporaryFiles {
-                try? FileManager.default.removeItem(at: fileURL)
-            }
-            for directoryURL in cleanupDirectories {
-                try? FileManager.default.removeItem(at: directoryURL)
-            }
-        }
-
-        for chunk in chunks {
-            try checkCancellation()
-            let chunkSize = try fileSize(of: chunk.fileURL)
-            guard chunkSize <= configuration.uploadSafetyLimitBytes else {
-                throw OpenAITranscriptionEngineError.fileTooLarge(
-                    limitBytes: configuration.uploadSafetyLimitBytes
-                )
-            }
-
-            let contextualPrompt: String?
-            if combined.isEmpty {
-                contextualPrompt = prompt
-            } else {
-                let tail = String(combined.suffix(configuration.contextCharacterLimit))
-                let contextLine = "Previous transcript context: \(tail)"
-                contextualPrompt = Self.sanitizePrompt(
-                    [prompt, contextLine].compactMap { $0 }.joined(separator: "\n")
-                )
-            }
-
-            let chunkText = try await transcribeFileWithRetries(
-                chunk.fileURL,
-                locale: locale,
-                prompt: contextualPrompt,
-                keywords: keywords,
-                apiKey: apiKey
-            )
-            combined = Self.mergeTranscript(combined, Self.cleanTranscript(chunkText))
-        }
-
-        return combined
-    }
-
-    private func transcribeFileWithRetries(
-        _ fileURL: URL,
-        locale: String?,
-        prompt: String?,
-        keywords: [String],
-        apiKey: String
-    ) async throws -> String {
-        var attempt = 0
-
-        while true {
-            try checkCancellation()
-            do {
-                return try await performRequest(
-                    fileURL: fileURL,
-                    locale: locale,
-                    prompt: prompt,
-                    keywords: keywords,
-                    apiKey: apiKey
-                )
-            } catch {
-                if let engineError = error as? OpenAITranscriptionEngineError,
-                   engineError == .cancelled {
-                    throw error
-                }
-
-                guard attempt < max(0, configuration.retryCount), Self.shouldRetry(error) else {
-                    throw error
-                }
-
-                attempt += 1
-                try checkCancellation()
-                try await sleep(configuration.retryDelayNanoseconds(attempt))
-            }
-        }
-    }
-
-    private func performRequest(
-        fileURL: URL,
-        locale: String?,
-        prompt: String?,
-        keywords: [String],
-        apiKey: String
-    ) async throws -> String {
-        let boundary = "OpenSuperWhisper-\(UUID().uuidString)"
-        var request = URLRequest(url: configuration.endpoint)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try Self.makeMultipartBody(
-            fileURL: fileURL,
-            boundary: boundary,
-            locale: locale,
-            prompt: prompt,
-            keywords: keywords
-        )
-
-        let requestTask = Task<(Data, URLResponse), Error> {
-            do {
-                return try await session.data(for: request)
-            } catch let error as URLError {
-                throw OpenAITranscriptionEngineError.network(error)
-            }
-        }
-        registerActiveRequest(requestTask)
-        defer { withStateLock { activeRequest = nil } }
-
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await withTaskCancellationHandler(operation: {
-                try await requestTask.value
-            }, onCancel: {
-                requestTask.cancel()
-            })
-        } catch is CancellationError {
-            throw OpenAITranscriptionEngineError.cancelled
-        }
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw OpenAITranscriptionEngineError.responseDecodingFailed
-        }
-
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            let message = Self.decodeAPIErrorMessage(data)
-            throw OpenAITranscriptionEngineError.httpError(
-                status: httpResponse.statusCode,
-                message: message
-            )
-        }
-
-        guard Self.isJSONContentType(httpResponse.value(forHTTPHeaderField: "Content-Type")) else {
-            throw OpenAITranscriptionEngineError.responseDecodingFailed
-        }
-        guard let decoded = try? JSONDecoder().decode(OpenAITranscriptionResponse.self, from: data) else {
-            throw OpenAITranscriptionEngineError.responseDecodingFailed
-        }
-        return decoded.text
-    }
-
-    /// Registers a request while holding the same lock used by `cancel()`.
-    /// If cancellation won the race before registration, cancel the newly
-    /// registered task immediately instead of leaving it orphaned.
-    private func registerActiveRequest(_ request: Task<(Data, URLResponse), Error>) {
-        let shouldCancel = withStateLock {
-            activeRequest = request
-            return cancelled
-        }
-        if shouldCancel {
-            request.cancel()
-        }
-    }
-
-    private static func isJSONContentType(_ value: String?) -> Bool {
-        // Content-Type is advisory on responses from intermediaries. When it
-        // is omitted, still require the body to decode as the expected JSON
-        // shape below; an HTML/proxy page therefore cannot slip through.
-        guard let value else { return true }
-        let mimeType = value
-            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
-            .first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard let mimeType else { return false }
-        return mimeType == "application/json" || mimeType.hasSuffix("+json")
-    }
-
-    private func withStateLock<T>(_ body: () -> T) -> T {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return body()
+        operationLock.withLock { activeOperation }?.requestCancel()
     }
 
     // MARK: - Multipart and normalization helpers
@@ -547,6 +404,17 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
         try appendFile()
         body.append(Data("--\(boundary)--\r\n".utf8))
         return body
+    }
+
+    fileprivate static func isJSONContentType(_ value: String?) -> Bool {
+        guard let value else { return true }
+        let mimeType = value
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard let mimeType else { return false }
+        return mimeType == "application/json" || mimeType.hasSuffix("+json")
     }
 
     static func normalizedLanguageIdentifier(_ identifier: String) -> String? {
@@ -701,11 +569,490 @@ public final class OpenAITranscriptionEngine: @unchecked Sendable, Transcription
         }
     }
 
-    private static func decodeAPIErrorMessage(_ data: Data) -> String? {
+    fileprivate static func decodeAPIErrorMessage(_ data: Data) -> String? {
         if let response = try? JSONDecoder().decode(OpenAIAPIErrorResponse.self, from: data) {
             return response.error.message
         }
         return String(data: data, encoding: .utf8)
+    }
+}
+
+/// One independently cancellable OpenAI upload. The engine remains a thin
+/// compatibility adapter; this handle owns every child task and temporary
+/// artifact for the provider boundary.
+private final class OpenAIFileTranscriptionOperation: @unchecked Sendable, TranscriptionFileOperation {
+    let events: AsyncStream<TranscriptionOperationEvent>
+
+    private let eventContinuation: AsyncStream<TranscriptionOperationEvent>.Continuation
+    private let session: URLSession
+    private let apiKeyLoader: @Sendable () throws -> String?
+    private let chunker: any OpenAITranscriptionChunker
+    private let configuration: OpenAITranscriptionConfiguration
+    private let sleep: @Sendable (UInt64) async throws -> Void
+    private let fileSystem: any OpenAITranscriptionFileSystem
+    private let diagnosticSink: any TranscriptionDiagnosticSink
+    private let fileURL: URL
+    private let locale: Locale
+    private let context: String?
+    private let expectedTerms: [String]
+    private let operationToken = SessionOperationToken()
+    private let stateLock = NSLock()
+    private var workTask: Task<Transcript, Error>?
+    private var requestTask: Task<(Data, URLResponse), Error>?
+    private var delayTask: Task<Void, Error>?
+    private var cancelled = false
+    private var eventsFinished = false
+
+    init(
+        session: URLSession,
+        apiKeyLoader: @escaping @Sendable () throws -> String?,
+        chunker: any OpenAITranscriptionChunker,
+        configuration: OpenAITranscriptionConfiguration,
+        sleep: @escaping @Sendable (UInt64) async throws -> Void,
+        fileSystem: any OpenAITranscriptionFileSystem,
+        diagnosticSink: any TranscriptionDiagnosticSink,
+        fileURL: URL,
+        locale: Locale,
+        context: String?,
+        expectedTerms: [String]
+    ) {
+        var continuation: AsyncStream<TranscriptionOperationEvent>.Continuation?
+        self.events = AsyncStream { continuation = $0 }
+        self.eventContinuation = continuation!
+        self.session = session
+        self.apiKeyLoader = apiKeyLoader
+        self.chunker = chunker
+        self.configuration = configuration
+        self.sleep = sleep
+        self.fileSystem = fileSystem
+        self.diagnosticSink = diagnosticSink
+        self.fileURL = fileURL
+        self.locale = locale
+        self.context = context
+        self.expectedTerms = expectedTerms
+        self.eventContinuation.onTermination = { [weak self] _ in
+            self?.requestCancel()
+        }
+    }
+
+    func value() async throws -> Transcript {
+        let task = makeWorkTask()
+        return try await withTaskCancellationHandler(operation: {
+            try await task.value
+        }, onCancel: {
+            self.requestCancel()
+        })
+    }
+
+    func cancelAndWait() async {
+        let task = requestCancelAndReturnTask()
+        _ = try? await task?.value
+    }
+
+    /// Compatibility cancellation is synchronous while still reaching the
+    /// request, export/chunker task, and retry delay immediately.
+    func requestCancel() {
+        _ = requestCancelAndReturnTask()
+    }
+
+    @discardableResult
+    private func requestCancelAndReturnTask() -> Task<Transcript, Error>? {
+        let values: (Task<Transcript, Error>?, Task<(Data, URLResponse), Error>?, Task<Void, Error>?) = stateLock.withLock {
+            cancelled = true
+            return (workTask, requestTask, delayTask)
+        }
+        values.0?.cancel()
+        values.1?.cancel()
+        values.2?.cancel()
+        return values.0
+    }
+
+    private func makeWorkTask() -> Task<Transcript, Error> {
+        stateLock.lock()
+        if let workTask {
+            stateLock.unlock()
+            return workTask
+        }
+        if cancelled {
+            let task = Task<Transcript, Error> { throw OpenAITranscriptionEngineError.cancelled }
+            workTask = task
+            stateLock.unlock()
+            return task
+        }
+        let task = Task { [self] in
+            do {
+                let transcript = try await run()
+                recordDiagnostic(phase: .transcribing, outcome: .completed)
+                finishEvents()
+                return transcript
+            } catch is CancellationError {
+                recordDiagnostic(phase: .cancelling, outcome: .cancelled)
+                finishEvents()
+                throw OpenAITranscriptionEngineError.cancelled
+            } catch let error as OpenAITranscriptionEngineError {
+                recordDiagnostic(
+                    phase: error == .cancelled ? .cancelling : .transcribing,
+                    outcome: error == .cancelled ? .cancelled : .failed
+                )
+                finishEvents()
+                throw error
+            } catch {
+                if isCancelled() || Task.isCancelled {
+                    recordDiagnostic(phase: .cancelling, outcome: .cancelled)
+                    finishEvents()
+                    throw OpenAITranscriptionEngineError.cancelled
+                }
+                recordDiagnostic(phase: .transcribing, outcome: .failed)
+                finishEvents()
+                throw error
+            }
+        }
+        workTask = task
+        stateLock.unlock()
+        return task
+    }
+
+    private func run() async throws -> Transcript {
+        try checkCancellation()
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw OpenAITranscriptionEngineError.invalidAudioFile(fileURL.lastPathComponent)
+        }
+
+        emit(.preparing)
+        let apiKey = try loadAPIKey()
+        let prompt = OpenAITranscriptionEngine.sanitizePrompt(context)
+        let keywords = OpenAITranscriptionEngine.sanitizeKeywords(expectedTerms)
+        let language = OpenAITranscriptionEngine.normalizedLanguageIdentifier(locale.identifier)
+
+        emit(.exporting)
+        let chunks = try await chunker.makeChunks(
+            for: fileURL,
+            safetyLimitBytes: configuration.uploadSafetyLimitBytes,
+            maximumChunkDuration: configuration.maximumChunkDuration,
+            overlap: configuration.chunkOverlap
+        )
+        defer { cleanup(chunks ?? []) }
+
+        let text: String
+        if let chunks, !chunks.isEmpty {
+            text = try await transcribeChunks(
+                chunks,
+                locale: language,
+                prompt: prompt,
+                keywords: keywords,
+                apiKey: apiKey
+            )
+        } else {
+            let size = try fileSize(of: fileURL)
+            guard size <= configuration.uploadSafetyLimitBytes else {
+                throw OpenAITranscriptionEngineError.fileTooLarge(
+                    limitBytes: configuration.uploadSafetyLimitBytes
+                )
+            }
+            emit(.uploading(part: 1, total: 1, fraction: 0))
+            text = try await transcribeFileWithRetries(
+                fileURL,
+                locale: language,
+                prompt: prompt,
+                keywords: keywords,
+                apiKey: apiKey,
+                part: 1,
+                total: 1
+            )
+            emit(.uploading(part: 1, total: 1, fraction: 1))
+        }
+
+        try checkCancellation()
+        emit(.transcribing)
+        return Transcript(
+            text: OpenAITranscriptionEngine.cleanTranscript(text),
+            locale: locale,
+            segments: []
+        )
+    }
+
+    private func transcribeChunks(
+        _ chunks: [OpenAIAudioChunk],
+        locale: String?,
+        prompt: String?,
+        keywords: [String],
+        apiKey: String
+    ) async throws -> String {
+        var combined = ""
+        for (offset, chunk) in chunks.enumerated() {
+            try checkCancellation()
+            let chunkSize = try fileSize(of: chunk.fileURL)
+            guard chunkSize <= configuration.uploadSafetyLimitBytes else {
+                throw OpenAITranscriptionEngineError.fileTooLarge(
+                    limitBytes: configuration.uploadSafetyLimitBytes
+                )
+            }
+            let contextualPrompt: String?
+            if combined.isEmpty {
+                contextualPrompt = prompt
+            } else {
+                let tail = String(combined.suffix(configuration.contextCharacterLimit))
+                contextualPrompt = OpenAITranscriptionEngine.sanitizePrompt(
+                    [prompt, "Previous transcript context: \(tail)"].compactMap { $0 }.joined(separator: "\n")
+                )
+            }
+
+            let part = offset + 1
+            emit(.uploading(part: part, total: chunks.count, fraction: 0))
+            let chunkText = try await transcribeFileWithRetries(
+                chunk.fileURL,
+                locale: locale,
+                prompt: contextualPrompt,
+                keywords: keywords,
+                apiKey: apiKey,
+                part: part,
+                total: chunks.count
+            )
+            emit(.uploading(part: part, total: chunks.count, fraction: 1))
+            combined = OpenAITranscriptionEngine.mergeTranscript(
+                combined,
+                OpenAITranscriptionEngine.cleanTranscript(chunkText)
+            )
+        }
+        return combined
+    }
+
+    private func transcribeFileWithRetries(
+        _ fileURL: URL,
+        locale: String?,
+        prompt: String?,
+        keywords: [String],
+        apiKey: String,
+        part: Int,
+        total: Int
+    ) async throws -> String {
+        var attempt = 0
+        while true {
+            try checkCancellation()
+            do {
+                return try await performRequest(
+                    fileURL: fileURL,
+                    locale: locale,
+                    prompt: prompt,
+                    keywords: keywords,
+                    apiKey: apiKey
+                )
+            } catch {
+                if let openAIError = error as? OpenAITranscriptionEngineError,
+                   openAIError == .cancelled {
+                    throw openAIError
+                }
+                guard attempt < configuration.retryCount, shouldRetry(error) else {
+                    throw error
+                }
+                attempt += 1
+                emit(.retrying(attempt: attempt, maximum: configuration.retryCount))
+                try checkCancellation()
+                let delay = Task<Void, Error> {
+                    try await sleep(configuration.retryDelayNanoseconds(attempt))
+                }
+                registerDelay(delay)
+                defer { clearDelay(delay) }
+                try await withTaskCancellationHandler(operation: {
+                    try await delay.value
+                }, onCancel: {
+                    delay.cancel()
+                })
+                _ = (part, total)
+            }
+        }
+    }
+
+    private func performRequest(
+        fileURL: URL,
+        locale: String?,
+        prompt: String?,
+        keywords: [String],
+        apiKey: String
+    ) async throws -> String {
+        try checkCancellation()
+        let boundary = "OpenSuperWhisper-\(UUID().uuidString)"
+        var request = URLRequest(url: configuration.endpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try OpenAITranscriptionEngine.makeMultipartBody(
+            fileURL: fileURL,
+            boundary: boundary,
+            locale: locale,
+            prompt: prompt,
+            keywords: keywords
+        )
+
+        let requestTask = Task<(Data, URLResponse), Error> {
+            do { return try await session.data(for: request) }
+            catch let error as URLError { throw OpenAITranscriptionEngineError.network(error) }
+        }
+        registerRequest(requestTask)
+        defer { clearRequest(requestTask) }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await withTaskCancellationHandler(operation: {
+                try await requestTask.value
+            }, onCancel: {
+                requestTask.cancel()
+            })
+        } catch is CancellationError {
+            throw OpenAITranscriptionEngineError.cancelled
+        } catch let error as OpenAITranscriptionEngineError {
+            if case let .network(urlError) = error, urlError.code == .cancelled {
+                throw OpenAITranscriptionEngineError.cancelled
+            }
+            throw error
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OpenAITranscriptionEngineError.responseDecodingFailed
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw OpenAITranscriptionEngineError.httpError(
+                status: httpResponse.statusCode,
+                message: OpenAITranscriptionEngine.decodeAPIErrorMessage(data)
+            )
+        }
+        guard OpenAITranscriptionEngine.isJSONContentType(httpResponse.value(forHTTPHeaderField: "Content-Type")),
+              let decoded = try? JSONDecoder().decode(OpenAITranscriptionResponse.self, from: data) else {
+            throw OpenAITranscriptionEngineError.responseDecodingFailed
+        }
+        return decoded.text
+    }
+
+    private func loadAPIKey() throws -> String {
+        let key: String?
+        do { key = try apiKeyLoader() }
+        catch { throw OpenAITranscriptionEngineError.keychainFailure(error.localizedDescription) }
+        let trimmed = key?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { throw OpenAITranscriptionEngineError.missingAPIKey }
+        return trimmed
+    }
+
+    private func fileSize(of url: URL) throws -> Int {
+        do { return try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 }
+        catch { throw OpenAITranscriptionEngineError.invalidAudioFile(url.lastPathComponent) }
+    }
+
+    private func shouldRetry(_ error: Error) -> Bool {
+        if let error = error as? OpenAITranscriptionEngineError {
+            switch error {
+            case let .httpError(status, _):
+                return status == 408 || status == 425 || status == 429 || (500...599).contains(status)
+            case let .network(urlError): return shouldRetry(urlError)
+            default: return false
+            }
+        }
+        if let urlError = error as? URLError { return shouldRetry(urlError) }
+        return false
+    }
+
+    private func shouldRetry(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .networkConnectionLost, .notConnectedToInternet, .secureConnectionFailed,
+             .cannotLoadFromNetwork, .resourceUnavailable:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func checkCancellation() throws {
+        if Task.isCancelled || isCancelled() { throw OpenAITranscriptionEngineError.cancelled }
+    }
+
+    private func isCancelled() -> Bool { stateLock.withLock { cancelled } }
+
+    private func registerRequest(_ request: Task<(Data, URLResponse), Error>) {
+        let cancel = stateLock.withLock { () -> Bool in
+            requestTask = request
+            return cancelled
+        }
+        if cancel { request.cancel() }
+    }
+
+    private func clearRequest(_ request: Task<(Data, URLResponse), Error>) {
+        _ = request
+        stateLock.withLock { requestTask = nil }
+    }
+
+    private func registerDelay(_ delay: Task<Void, Error>) {
+        let cancel = stateLock.withLock { () -> Bool in
+            delayTask = delay
+            return cancelled
+        }
+        if cancel { delay.cancel() }
+    }
+
+    private func clearDelay(_ delay: Task<Void, Error>) {
+        _ = delay
+        stateLock.withLock { delayTask = nil }
+    }
+
+    private func emit(_ phase: TranscriptionOperationPhase) {
+        eventContinuation.yield(TranscriptionOperationEvent(phase: phase))
+        diagnosticSink.record(
+            TranscriptionDiagnosticEvent(
+                operationToken: operationToken,
+                source: .importedFile,
+                backend: .openAI,
+                phase: phase,
+                chunkIndex: phase.uploadProgress?.part,
+                outcome: .progressed
+            )
+        )
+    }
+
+    private func cleanup(_ chunks: [OpenAIAudioChunk]) {
+        var files = Set<URL>()
+        var directories = Set<URL>()
+        for chunk in chunks {
+            if chunk.isTemporary { files.insert(chunk.fileURL) }
+            if let directory = chunk.cleanupDirectory { directories.insert(directory) }
+        }
+        for file in files {
+            do { try fileSystem.removeItem(at: file) }
+            catch { diagnoseCleanupFailure() }
+        }
+        for directory in directories {
+            do { try fileSystem.removeItem(at: directory) }
+            catch { diagnoseCleanupFailure() }
+        }
+    }
+
+    private func diagnoseCleanupFailure() {
+        recordDiagnostic(phase: .exporting, outcome: .cleanupFailed)
+    }
+
+    private func recordDiagnostic(
+        phase: TranscriptionOperationPhase,
+        outcome: TranscriptionDiagnosticOutcome
+    ) {
+        diagnosticSink.record(
+            TranscriptionDiagnosticEvent(
+                operationToken: operationToken,
+                source: .importedFile,
+                backend: .openAI,
+                phase: phase,
+                outcome: outcome
+            )
+        )
+    }
+
+    private func finishEvents() {
+        stateLock.lock()
+        guard !eventsFinished else {
+            stateLock.unlock()
+            return
+        }
+        eventsFinished = true
+        stateLock.unlock()
+        eventContinuation.finish()
     }
 }
 
@@ -724,7 +1071,11 @@ private struct OpenAIAPIErrorResponse: Decodable {
 /// AVFoundation-backed chunking used by the app. It exports short overlapping
 /// M4A files so each upload remains under the safety ceiling.
 public final class AVFoundationOpenAITranscriptionChunker: @unchecked Sendable, OpenAITranscriptionChunker {
-    public init() {}
+    private let exporter: any OpenAITranscriptionChunkExporter
+
+    public init(exporter: any OpenAITranscriptionChunkExporter = AVFoundationOpenAITranscriptionChunkExporter()) {
+        self.exporter = exporter
+    }
 
     public func makeChunks(
         for fileURL: URL,
@@ -802,26 +1153,25 @@ public final class AVFoundationOpenAITranscriptionChunker: @unchecked Sendable, 
                 let duration = max(0, end - start)
                 guard duration > 0 else { break }
 
-                let outputURL = directory.appendingPathComponent("chunk-\(chunks.count).m4a")
-                try await export(
+                let outputURLs = try await exportWithSubdivision(
                     asset: asset,
+                    fileURL: fileURL,
                     start: start,
                     duration: duration,
-                    outputURL: outputURL,
-                    fileLengthLimit: safetyLimitBytes
+                    directory: directory,
+                    outputIndex: chunks.count,
+                    fileLengthLimit: safetyLimitBytes,
+                    level: 0
                 )
-
-                let size = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                guard size <= safetyLimitBytes else {
-                    throw OpenAITranscriptionEngineError.fileTooLarge(limitBytes: safetyLimitBytes)
-                }
-                chunks.append(
-                    OpenAIAudioChunk(
-                        fileURL: outputURL,
-                        isTemporary: true,
-                        cleanupDirectory: directory
+                for outputURL in outputURLs {
+                    chunks.append(
+                        OpenAIAudioChunk(
+                            fileURL: outputURL,
+                            isTemporary: true,
+                            cleanupDirectory: directory
+                        )
                     )
-                )
+                }
                 coreStart = coreEnd
             }
         } catch {
@@ -852,45 +1202,95 @@ public final class AVFoundationOpenAITranscriptionChunker: @unchecked Sendable, 
         )
     }
 
-    private func export(
+    /// Deterministic subdivision policy shared by the exporter and tests. A
+    /// candidate is split at most eight times and is never split into pieces
+    /// shorter than five seconds solely to satisfy an upload ceiling.
+    public static func subdivisionDurations(
+        duration: TimeInterval,
+        maximumLevels: Int = 8,
+        minimumDuration: TimeInterval = 5
+    ) -> [TimeInterval] {
+        let safeDuration = max(0, duration)
+        guard safeDuration > 0 else { return [] }
+        let levels = max(0, maximumLevels)
+        let minimum = max(0.001, minimumDuration)
+        var count = 1
+        for _ in 0..<levels {
+            if safeDuration / Double(count * 2) < minimum { break }
+            count *= 2
+        }
+        let part = safeDuration / Double(count)
+        return Array(repeating: part, count: count)
+    }
+
+    private func exportWithSubdivision(
         asset: AVAsset,
+        fileURL: URL,
         start: TimeInterval,
         duration: TimeInterval,
-        outputURL: URL,
-        fileLengthLimit: Int
-    ) async throws {
-        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
-            throw OpenAITranscriptionEngineError.chunkingFailed("The M4A export session could not be created.")
-        }
-        let assetDuration = try await asset.load(.duration)
-        let timescale: CMTimeScale = assetDuration.timescale == 0 ? 600 : assetDuration.timescale
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = .m4a
-        exportSession.shouldOptimizeForNetworkUse = true
-        exportSession.timeRange = CMTimeRange(
-            start: CMTime(seconds: start, preferredTimescale: timescale),
-            duration: CMTime(seconds: duration, preferredTimescale: timescale)
-        )
-        exportSession.fileLengthLimit = Int64(fileLengthLimit)
-
-        let box = ExportSessionBox(exportSession)
+        directory: URL,
+        outputIndex: Int,
+        fileLengthLimit: Int,
+        level: Int
+    ) async throws -> [URL] {
+        try Task.checkCancellation()
+        let outputURL = directory.appendingPathComponent("chunk-\(outputIndex)-\(level).m4a")
         do {
-            try await withTaskCancellationHandler(operation: {
-                try await box.value.export(to: outputURL, as: .m4a)
-            }, onCancel: {
-                box.value.cancelExport()
-            })
+            try await exporter.export(
+                fileURL: fileURL,
+                start: start,
+                duration: duration,
+                outputURL: outputURL,
+                fileLengthLimit: fileLengthLimit
+            )
+            let size = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard size <= fileLengthLimit else {
+                throw OpenAITranscriptionEngineError.fileTooLarge(limitBytes: fileLengthLimit)
+            }
+            return [outputURL]
         } catch is CancellationError {
             throw OpenAITranscriptionEngineError.cancelled
         } catch {
             if Task.isCancelled {
                 throw OpenAITranscriptionEngineError.cancelled
             }
-            throw error
+            let oversized = (try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0
+            let isSizeFailure = oversized > fileLengthLimit ||
+                (error as? OpenAITranscriptionEngineError).map {
+                    if case .fileTooLarge = $0 { return true }
+                    return false
+                } == true
+            let half = duration / 2
+            guard isSizeFailure, level < 8, half >= 5 else {
+                try? FileManager.default.removeItem(at: outputURL)
+                throw error
+            }
+            try? FileManager.default.removeItem(at: outputURL)
+            let first = try await exportWithSubdivision(
+                asset: asset,
+                fileURL: fileURL,
+                start: start,
+                duration: half,
+                directory: directory,
+                outputIndex: outputIndex * 2,
+                fileLengthLimit: fileLengthLimit,
+                level: level + 1
+            )
+            let second = try await exportWithSubdivision(
+                asset: asset,
+                fileURL: fileURL,
+                start: start + half,
+                duration: duration - half,
+                directory: directory,
+                outputIndex: outputIndex * 2 + 1,
+                fileLengthLimit: fileLengthLimit,
+                level: level + 1
+            )
+            return first + second
         }
     }
 
-    private final class ExportSessionBox: @unchecked Sendable {
+    fileprivate final class ExportSessionBox: @unchecked Sendable {
         let value: AVAssetExportSession
 
         init(_ value: AVAssetExportSession) {

@@ -75,16 +75,15 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
             OpenAIAudioChunk(fileURL: firstURL),
             OpenAIAudioChunk(fileURL: secondURL)
         ])
-        let recorder = URLProtocolRecorder(responses: [
+        let client = makeClient(responses: [
             .success(text: "hello from the first chunk"),
             .success(text: "first chunk and the second chunk")
         ])
-        let session = makeSession(recorder: recorder)
         let engine = OpenAITranscriptionEngine(
             apiKey: "test-key",
-            session: session,
+            session: client.session,
             chunker: chunker,
-            configuration: .init(retryCount: 0),
+            configuration: .init(endpoint: client.endpoint, retryCount: 0),
             sleep: { _ in }
         )
 
@@ -97,23 +96,23 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
 
         XCTAssertEqual(transcript.text, "hello from the first chunk and the second chunk")
         XCTAssertTrue(transcript.segments.isEmpty)
-        XCTAssertEqual(recorder.requests.count, 2)
-        XCTAssertTrue(recorder.requestBodies[1].contains("Previous transcript context: hello from the first chunk"))
+        XCTAssertEqual(client.recorder.requests.count, 2)
+        XCTAssertTrue(client.recorder.requestBodies[1].contains("Previous transcript context: hello from the first chunk"))
     }
 
     func testRetriesTransientHTTPFailure() async throws {
         let fileURL = try temporaryAudioFile(contents: Data("audio".utf8), fileExtension: "wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        let recorder = URLProtocolRecorder(responses: [
+        let client = makeClient(responses: [
             .http(status: 503, body: "temporary"),
             .success(text: "recovered")
         ])
         let engine = OpenAITranscriptionEngine(
             apiKey: "test-key",
-            session: makeSession(recorder: recorder),
+            session: client.session,
             chunker: TestChunker(chunks: nil),
-            configuration: .init(retryCount: 1),
+            configuration: .init(endpoint: client.endpoint, retryCount: 1),
             sleep: { _ in }
         )
 
@@ -125,21 +124,66 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         )
 
         XCTAssertEqual(transcript.text, "recovered")
-        XCTAssertEqual(recorder.requests.count, 2)
+        XCTAssertEqual(client.recorder.requests.count, 2)
+    }
+
+    func testParallelClientsKeepResponsesIsolated() async throws {
+        let firstURL = try temporaryAudioFile(contents: Data("first".utf8), fileExtension: "wav")
+        let secondURL = try temporaryAudioFile(contents: Data("second".utf8), fileExtension: "wav")
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+        }
+
+        let firstClient = makeClient(responses: [.success(text: "first response")])
+        let secondClient = makeClient(responses: [.success(text: "second response")])
+        let firstEngine = OpenAITranscriptionEngine(
+            apiKey: "first-key",
+            session: firstClient.session,
+            chunker: TestChunker(chunks: nil),
+            configuration: .init(endpoint: firstClient.endpoint, retryCount: 0),
+            sleep: { _ in }
+        )
+        let secondEngine = OpenAITranscriptionEngine(
+            apiKey: "second-key",
+            session: secondClient.session,
+            chunker: TestChunker(chunks: nil),
+            configuration: .init(endpoint: secondClient.endpoint, retryCount: 0),
+            sleep: { _ in }
+        )
+
+        async let firstResult = firstEngine.transcribeFile(
+            at: firstURL,
+            locale: Locale(identifier: "en-US"),
+            context: nil,
+            expectedTerms: []
+        )
+        async let secondResult = secondEngine.transcribeFile(
+            at: secondURL,
+            locale: Locale(identifier: "en-US"),
+            context: nil,
+            expectedTerms: []
+        )
+
+        let (firstTranscript, secondTranscript) = try await (firstResult, secondResult)
+        XCTAssertEqual(firstTranscript.text, "first response")
+        XCTAssertEqual(secondTranscript.text, "second response")
+        XCTAssertEqual(firstClient.recorder.requests.count, 1)
+        XCTAssertEqual(secondClient.recorder.requests.count, 1)
     }
 
     func testRejectsNonJSONSuccessBodyEvenWhenItIsNonemptyUTF8() async throws {
         let fileURL = try temporaryAudioFile(contents: Data("audio".utf8), fileExtension: "wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        let recorder = URLProtocolRecorder(responses: [
+        let client = makeClient(responses: [
             .raw(status: 200, body: Data("<html>proxy error</html>".utf8), contentType: "text/html")
         ])
         let engine = OpenAITranscriptionEngine(
             apiKey: "test-key",
-            session: makeSession(recorder: recorder),
+            session: client.session,
             chunker: TestChunker(chunks: nil),
-            configuration: .init(retryCount: 0),
+            configuration: .init(endpoint: client.endpoint, retryCount: 0),
             sleep: { _ in }
         )
 
@@ -160,14 +204,14 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         let fileURL = try temporaryAudioFile(contents: Data("audio".utf8), fileExtension: "wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        let recorder = URLProtocolRecorder(responses: [
+        let client = makeClient(responses: [
             .raw(status: 200, body: Data("not-json".utf8), contentType: "application/json")
         ])
         let engine = OpenAITranscriptionEngine(
             apiKey: "test-key",
-            session: makeSession(recorder: recorder),
+            session: client.session,
             chunker: TestChunker(chunks: nil),
-            configuration: .init(retryCount: 0),
+            configuration: .init(endpoint: client.endpoint, retryCount: 0),
             sleep: { _ in }
         )
 
@@ -188,7 +232,7 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         let fileURL = try temporaryAudioFile(contents: Data("audio".utf8), fileExtension: "wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        let recorder = URLProtocolRecorder(responses: [
+        let client = makeClient(responses: [
             .raw(
                 status: 200,
                 body: Data("{\"text\":\"decoded\"}".utf8),
@@ -197,9 +241,9 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         ])
         let engine = OpenAITranscriptionEngine(
             apiKey: "test-key",
-            session: makeSession(recorder: recorder),
+            session: client.session,
             chunker: TestChunker(chunks: nil),
-            configuration: .init(retryCount: 0),
+            configuration: .init(endpoint: client.endpoint, retryCount: 0),
             sleep: { _ in }
         )
 
@@ -217,12 +261,12 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         let fileURL = try temporaryAudioFile(contents: Data(repeating: 0, count: 11), fileExtension: "wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        let recorder = URLProtocolRecorder(responses: [.success(text: "should not upload")])
+        let client = makeClient(responses: [.success(text: "should not upload")])
         let engine = OpenAITranscriptionEngine(
             apiKey: "test-key",
-            session: makeSession(recorder: recorder),
+            session: client.session,
             chunker: TestChunker(chunks: nil),
-            configuration: .init(retryCount: 0, uploadSafetyLimitBytes: 10),
+            configuration: .init(endpoint: client.endpoint, retryCount: 0, uploadSafetyLimitBytes: 10),
             sleep: { _ in }
         )
 
@@ -237,19 +281,19 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
         } catch let error as OpenAITranscriptionEngineError {
             XCTAssertEqual(error, .fileTooLarge(limitBytes: 10))
         }
-        XCTAssertTrue(recorder.requests.isEmpty)
+        XCTAssertTrue(client.recorder.requests.isEmpty)
     }
 
     func testCancellationCancelsPendingRequest() async throws {
         let fileURL = try temporaryAudioFile(contents: Data("audio".utf8), fileExtension: "wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
-        let recorder = URLProtocolRecorder(responses: [.pending])
+        let client = makeClient(responses: [.pending])
         let engine = OpenAITranscriptionEngine(
             apiKey: "test-key",
-            session: makeSession(recorder: recorder),
+            session: client.session,
             chunker: TestChunker(chunks: nil),
-            configuration: .init(retryCount: 0),
+            configuration: .init(endpoint: client.endpoint, retryCount: 0),
             sleep: { _ in }
         )
         let task = Task {
@@ -261,9 +305,8 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
             )
         }
 
-        try await eventually {
-            !recorder.requests.isEmpty
-        }
+        let requestObserved = await client.recorder.waitForRequest(timeout: 5)
+        XCTAssertTrue(requestObserved, "The cancellation fixture never observed a request")
         engine.cancel()
 
         do {
@@ -277,28 +320,11 @@ final class OpenAITranscriptionEngineTests: XCTestCase {
     // MARK: - Test support
 
     private func temporaryAudioFile(contents: Data, fileExtension: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OpenSuperWhisperTests-\(UUID().uuidString).\(fileExtension)")
-        try contents.write(to: url)
-        return url
+        try TestFixture.temporaryFile(contents: contents, fileExtension: fileExtension)
     }
 
-    private func makeSession(recorder: URLProtocolRecorder) -> URLSession {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [RecordingURLProtocol.self]
-        RecordingURLProtocol.recorder = recorder
-        return URLSession(configuration: configuration)
-    }
-
-    private func eventually(
-        timeout: TimeInterval = 2,
-        condition: @escaping @Sendable () -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition() {
-            if Date() >= deadline { throw XCTSkip("Timed out waiting for URLProtocol request") }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+    private func makeClient(responses: [URLProtocolRecorder.Response]) -> TestOpenAIClient {
+        TestOpenAIClient(responses: responses)
     }
 }
 
@@ -325,6 +351,7 @@ private final class URLProtocolRecorder: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let requestEvents = TestEventRecorder()
     private(set) var requests: [URLRequest] = []
     private(set) var requestBodies: [String] = []
     private var responses: [Response]
@@ -334,12 +361,18 @@ private final class URLProtocolRecorder: @unchecked Sendable {
     }
 
     func record(_ request: URLRequest) -> Response {
-        lock.lock()
-        defer { lock.unlock() }
-        requests.append(request)
-        requestBodies.append(String(data: bodyData(for: request), encoding: .utf8) ?? "")
-        guard !responses.isEmpty else { return .success(text: "") }
-        return responses.removeFirst()
+        let response = lock.withLock { () -> Response in
+            requests.append(request)
+            requestBodies.append(String(data: bodyData(for: request), encoding: .utf8) ?? "")
+            guard !responses.isEmpty else { return .success(text: "") }
+            return responses.removeFirst()
+        }
+        requestEvents.record()
+        return response
+    }
+
+    func waitForRequest(timeout: TimeInterval) async -> Bool {
+        await requestEvents.wait(timeout: timeout)
     }
 
     private func bodyData(for request: URLRequest) -> Data {
@@ -363,14 +396,64 @@ private final class URLProtocolRecorder: @unchecked Sendable {
     }
 }
 
-private final class RecordingURLProtocol: URLProtocol {
-    static var recorder: URLProtocolRecorder!
+/// URLProtocol does not expose the URLSession configuration to a protocol
+/// instance. Each test client therefore gets a unique endpoint token, and the
+/// registry routes only that token to its instance-owned recorder. There is no
+/// process-global "current recorder" that a parallel test can overwrite.
+private enum RecordingURLProtocolRegistry {
+    private static let lock = NSLock()
+    private static var recorders: [String: URLProtocolRecorder] = [:]
 
+    static func register(_ recorder: URLProtocolRecorder) -> String {
+        let token = UUID().uuidString
+        lock.withLock { recorders[token] = recorder }
+        return token
+    }
+
+    static func recorder(for url: URL?) -> URLProtocolRecorder? {
+        guard let token = url?.pathComponents.last else { return nil }
+        return lock.withLock { recorders[token] }
+    }
+
+    static func unregister(_ token: String) {
+        _ = lock.withLock { recorders.removeValue(forKey: token) }
+    }
+}
+
+private final class TestOpenAIClient {
+    let session: URLSession
+    let recorder: URLProtocolRecorder
+    let endpoint: URL
+    private let token: String
+
+    init(responses: [URLProtocolRecorder.Response]) {
+        let recorder = URLProtocolRecorder(responses: responses)
+        let token = RecordingURLProtocolRegistry.register(recorder)
+        self.recorder = recorder
+        self.token = token
+        self.endpoint = URL(string: "https://open-super-whisper.test/\(token)")!
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RecordingURLProtocol.self]
+        self.session = URLSession(configuration: configuration)
+    }
+
+    deinit {
+        session.invalidateAndCancel()
+        RecordingURLProtocolRegistry.unregister(token)
+    }
+}
+
+private final class RecordingURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        let response = Self.recorder.record(request)
+        guard let recorder = RecordingURLProtocolRegistry.recorder(for: request.url) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let response = recorder.record(request)
         switch response {
         case let .success(text):
             let data = (try? JSONSerialization.data(withJSONObject: ["text": text])) ?? Data()

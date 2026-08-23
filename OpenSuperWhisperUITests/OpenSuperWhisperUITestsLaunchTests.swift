@@ -1,32 +1,47 @@
-//
-//  OpenSuperWhisperUITestsLaunchTests.swift
-//  OpenSuperWhisperUITests
-//
-//  Created by user on 05.02.2025.
-//
-
+import Foundation
 import XCTest
 
 final class OpenSuperWhisperUITestsLaunchTests: XCTestCase {
-
-    override class var runsForEachTargetApplicationUIConfiguration: Bool {
-        true
-    }
+    private var launchedApps: [XCUIApplication] = []
+    private var isolatedRoots: [URL] = []
+    override class var runsForEachTargetApplicationUIConfiguration: Bool { false }
 
     override func setUpWithError() throws {
         continueAfterFailure = false
     }
 
+    override func tearDownWithError() throws {
+        launchedApps.forEach { app in
+            if app.state != .notRunning { app.terminate() }
+        }
+        launchedApps.removeAll()
+        isolatedRoots.forEach { try? FileManager.default.removeItem(at: $0) }
+        isolatedRoots.removeAll()
+    }
+
     @MainActor
-    func testLaunch() throws {
+    func testLaunchSmokeScreenshot() {
         let app = XCUIApplication()
+        app.launchArguments = [
+            "--open-super-whisper-ui-test",
+            "-ApplePersistenceIgnoreState",
+            "YES"
+        ]
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenSuperWhisperUILaunch-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        isolatedRoots.append(root)
+        app.launchEnvironment = [
+            "OPEN_SUPER_WHISPER_UI_TEST": "1",
+            "OPEN_SUPER_WHISPER_UI_TEST_ID": UUID().uuidString,
+            "HOME": root.path
+        ]
         app.launch()
+        launchedApps.append(app)
 
-        // Insert steps here to perform after app launch but before taking a screenshot,
-        // such as logging into a test account or navigating somewhere in the app
-
+        XCTAssertTrue(app.buttons["Start recording"].waitForExistence(timeout: 5))
         let attachment = XCTAttachment(screenshot: app.screenshot())
-        attachment.name = "Launch Screen"
+        attachment.name = "Main recording surface"
         attachment.lifetime = .keepAlways
         add(attachment)
     }

@@ -6,7 +6,12 @@ import SwiftUI
 @MainActor
 final class SettingsViewModel: ObservableObject {
     @Published var transcriptionBackend: TranscriptionBackend {
-        didSet { AppPreferences.shared.transcriptionBackend = transcriptionBackend }
+        didSet {
+            AppPreferences.shared.transcriptionBackend = transcriptionBackend
+            if transcriptionBackend != .appleSpeech {
+                cancelAssetWork()
+            }
+        }
     }
 
     @Published var selectedLocaleIdentifier: String {
@@ -17,6 +22,8 @@ final class SettingsViewModel: ObservableObject {
                 return
             }
             AppPreferences.shared.localeIdentifier = normalized
+            guard !applyingResolvedLocale else { return }
+            cancelAssetWork()
             if transcriptionBackend == .appleSpeech {
                 refreshAppleSpeechAssets()
             }
@@ -59,10 +66,17 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var appleSpeechAssetStatus: AppleSpeechAssetStatus?
 
     private let apiKeyStore = OpenAIAPIKeyStore.shared
-    private let assetManager: AppleSpeechAssetManager
+    private let assetManager: any AppleSpeechAssetManaging
     private var cancellables = Set<AnyCancellable>()
+    private var refreshTask: Task<Void, Never>?
+    private var statusTask: Task<Void, Never>?
+    private var preparationTask: Task<Void, Never>?
+    private var refreshRequestID: AppleSpeechAssetRequestID?
+    private var statusRequestID: AppleSpeechAssetRequestID?
+    private var preparationRequestID: AppleSpeechAssetRequestID?
+    private var applyingResolvedLocale = false
 
-    init(assetManager: AppleSpeechAssetManager? = nil) {
+    init(assetManager: (any AppleSpeechAssetManaging)? = nil) {
         let resolvedAssetManager = assetManager ?? AppleSpeechAssetManager.shared
         let prefs = AppPreferences.shared
         self.transcriptionBackend = prefs.transcriptionBackend
@@ -77,16 +91,24 @@ final class SettingsViewModel: ObservableObject {
         self.appleSpeechAssetStatus = nil
         self.openAIAPIKey = (try? apiKeyStore.loadKey()) ?? ""
 
-        resolvedAssetManager.$currentStatus
-            .receive(on: RunLoop.main)
-            .sink { [weak self] status in
-                guard let self, let status else { return }
-                guard status.localeIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
-                    return
+        if let concreteManager = resolvedAssetManager as? AppleSpeechAssetManager {
+            concreteManager.$currentStatus
+                .receive(on: RunLoop.main)
+                .sink { [weak self] status in
+                    guard let self, let status else { return }
+                    guard status.localeIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
+                        return
+                    }
+                    self.appleSpeechAssetStatus = status
                 }
-                self.appleSpeechAssetStatus = status
-            }
-            .store(in: &cancellables)
+                .store(in: &cancellables)
+        }
+    }
+
+    deinit {
+        refreshTask?.cancel()
+        statusTask?.cancel()
+        preparationTask?.cancel()
     }
 
     var selectedLocale: Locale { LanguageUtil.locale(for: selectedLocaleIdentifier) }
@@ -96,9 +118,25 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func refreshAppleSpeechAssets() {
-        Task { @MainActor [weak self] in
+        refreshTask?.cancel()
+        let requestID = AppleSpeechAssetRequestID()
+        refreshRequestID = requestID
+        let requestedIdentifier = selectedLocaleIdentifier
+        let assetManager = self.assetManager
+        refreshTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.refreshRequestID == requestID {
+                    self.refreshTask = nil
+                    self.refreshRequestID = nil
+                }
+            }
             guard let self else { return }
-            let locales = await assetManager.refresh()
+            let locales = await assetManager.refresh(requestID: requestID)
+            guard !Task.isCancelled,
+                  self.refreshRequestID == requestID,
+                  requestedIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
+                return
+            }
             if !locales.isEmpty {
                 let identifiers = LanguageUtil.localeIdentifiers(for: locales)
                 availableLocaleIdentifiers = identifiers
@@ -106,40 +144,71 @@ final class SettingsViewModel: ObservableObject {
                     selectedLocaleIdentifier = LanguageUtil.defaultLocaleIdentifier
                 }
             }
-            await updateAppleSpeechAssetStatus()
+            guard self.refreshRequestID == requestID else { return }
+            refreshAppleSpeechAssetStatus()
         }
     }
 
     func prepareAppleSpeechAsset() {
+        statusTask?.cancel()
+        statusTask = nil
+        statusRequestID = nil
+        preparationTask?.cancel()
+        if let oldRequestID = preparationRequestID {
+            assetManager.cancelPreparation(requestID: oldRequestID)
+        }
         let requestedLocale = selectedLocale
         let requestedIdentifier = LanguageUtil.localeIdentifier(for: requestedLocale)
+        let requestID = AppleSpeechAssetRequestID()
+        preparationRequestID = requestID
         appleSpeechAssetStatus = AppleSpeechAssetStatus(
             locale: requestedLocale,
             state: .downloading,
             progress: 0
         )
 
-        Task { @MainActor [weak self] in
+        let assetManager = self.assetManager
+        preparationTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.preparationRequestID == requestID {
+                    self.preparationTask = nil
+                    self.preparationRequestID = nil
+                }
+            }
             guard let self else { return }
             do {
-                let resolved = try await assetManager.prepare(locale: requestedLocale)
-                guard requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                let resolved = try await assetManager.prepare(
+                    locale: requestedLocale,
+                    requestID: requestID
+                )
+                guard !Task.isCancelled,
+                      self.preparationRequestID == requestID,
+                      requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
                     return
                 }
                 let identifier = LanguageUtil.localeIdentifier(for: resolved)
-                let status = await assetManager.status(for: resolved)
-                guard requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
-                    return
-                }
                 if identifier.caseInsensitiveCompare(selectedLocaleIdentifier) != .orderedSame {
+                    self.applyingResolvedLocale = true
                     selectedLocaleIdentifier = identifier
+                    self.applyingResolvedLocale = false
+                }
+                let status = await assetManager.status(
+                    for: resolved,
+                    requestID: requestID
+                )
+                guard !Task.isCancelled,
+                      self.preparationRequestID == requestID,
+                      identifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                    return
                 }
                 appleSpeechAssetStatus = status
             } catch is CancellationError {
                 // A cancelled preparation is not a failure; the next view
                 // appearance can request it again.
             } catch {
-                guard requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
+                guard self.preparationRequestID == requestID,
+                      !Task.isCancelled,
+                      requestedIdentifier.caseInsensitiveCompare(selectedLocaleIdentifier) == .orderedSame else {
                     return
                 }
                 appleSpeechAssetStatus = AppleSpeechAssetStatus(
@@ -187,8 +256,47 @@ final class SettingsViewModel: ObservableObject {
         apiKeyStatusIsError = false
     }
 
-    private func updateAppleSpeechAssetStatus() async {
-        appleSpeechAssetStatus = await assetManager.status(for: selectedLocale)
+    private func refreshAppleSpeechAssetStatus() {
+        statusTask?.cancel()
+        let requestID = AppleSpeechAssetRequestID()
+        statusRequestID = requestID
+        let locale = selectedLocale
+        let requestedIdentifier = LanguageUtil.localeIdentifier(for: locale)
+        let assetManager = self.assetManager
+        statusTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.statusRequestID == requestID {
+                    self.statusTask = nil
+                    self.statusRequestID = nil
+                }
+            }
+            let status = await assetManager.status(for: locale, requestID: requestID)
+            guard let self,
+                  !Task.isCancelled,
+                  self.statusRequestID == requestID,
+                  requestedIdentifier.caseInsensitiveCompare(self.selectedLocaleIdentifier) == .orderedSame else {
+                return
+            }
+            self.appleSpeechAssetStatus = status
+        }
+    }
+
+    /// Cancels all asset work started by this settings sheet. Explicitly
+    /// notifying the manager closes the request even if Speech is suspended in
+    /// an installation call that does not immediately observe task cancel.
+    func cancelAssetWork() {
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshRequestID = nil
+        statusTask?.cancel()
+        statusTask = nil
+        statusRequestID = nil
+        preparationTask?.cancel()
+        if let preparationRequestID {
+            assetManager.cancelPreparation(requestID: preparationRequestID)
+        }
+        preparationTask = nil
+        preparationRequestID = nil
     }
 }
 
@@ -274,6 +382,7 @@ struct SettingsView: View {
                 viewModel.refreshAppleSpeechAssets()
             }
         }
+        .onDisappear { viewModel.cancelAssetWork() }
     }
 
     private var transcriptionSettings: some View {

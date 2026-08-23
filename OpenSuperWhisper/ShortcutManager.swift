@@ -1,110 +1,240 @@
 import AppKit
-import ApplicationServices
 import Carbon
-import Cocoa
+import Combine
 import Foundation
 import KeyboardShortcuts
-import SwiftUI
 
 extension KeyboardShortcuts.Name {
     static let toggleRecord = Self("toggleRecord", default: .init(.backtick, modifiers: .option))
     static let escape = Self("escape", default: .init(.escape))
 }
 
-class ShortcutManager {
+private final class ShortcutCallbackSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func next() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        value &+= 1
+        return value
+    }
+}
+
+/// Owns global shortcut callbacks on MainActor. Delayed hold work carries the
+/// operation token and generation that armed it, so a stale timer or key-up
+/// cannot stop a replacement operation.
+@MainActor
+final class ShortcutManager {
     static let shared = ShortcutManager()
 
-    // Current recording indicator view and state
-    private var activeVm: IndicatorViewModel?
-    private var holdWorkItem: DispatchWorkItem?
-    private let holdThreshold: TimeInterval = 0.3
+    typealias HoldScheduler = (
+        @escaping () -> Void,
+        TimeInterval
+    ) -> AnyCancellable
+
+    private static let callbackSequence = ShortcutCallbackSequence()
+
+    private let sessionController: DictationSessionController
+    private let indicatorManager: IndicatorWindowManager
+    private let holdThreshold: TimeInterval
+    private let holdScheduler: HoldScheduler
+    private var holdCancellable: AnyCancellable?
+    private var holdGeneration: UUID?
+    private var activeToken: SessionOperationToken?
+    private weak var activeVm: IndicatorViewModel?
     private var holdMode = false
+    private var keyDownSequence: UInt64?
+    private var lastHandledSequence: UInt64 = 0
 
-    private init() {
-        print("ShortcutManager init")
+    var operationToken: SessionOperationToken? { activeToken }
 
-        // Handle key down for recording shortcut: start or toggle and detect hold
-        KeyboardShortcuts.onKeyDown(for: .toggleRecord) {
-            // Cancel any pending hold detection
-            self.holdWorkItem?.cancel()
-            self.holdMode = false
-            // Perform UI actions on the main actor
-            Task { @MainActor in
-                if self.activeVm == nil {
-                    // FileDropHandler claims a drop before the shared
-                    // controller starts, so guard both ownership markers
-                    // before creating an indicator. This prevents a shortcut
-                    // press from later canceling work it did not start. The
-                    // checks and claim below are serialized on the main actor.
-                    guard !FileDropHandler.shared.isTranscribing,
-                          !DictationSessionController.shared.state.isBusy else { return }
+    init(
+        sessionController: DictationSessionController? = nil,
+        indicatorManager: IndicatorWindowManager? = nil,
+        holdThreshold: TimeInterval = 0.3,
+        holdScheduler: HoldScheduler? = nil,
+        registerShortcuts: Bool = true
+    ) {
+        self.sessionController = sessionController ?? .shared
+        self.indicatorManager = indicatorManager ?? .shared
+        self.holdThreshold = holdThreshold
+        self.holdScheduler = holdScheduler ?? Self.defaultHoldScheduler
 
-                    // First press: show indicator and start recording immediately
-                    let cursorPosition = FocusUtils.getCurrentCursorPosition()
-                    let indicatorPoint: NSPoint?
-                    if let caret = FocusUtils.getCaretRect(), let screen = FocusUtils.getFocusedWindowScreen() {
-                        let screenHeight = screen.frame.height
-                        indicatorPoint = NSPoint(x: caret.origin.x, y: screenHeight - caret.origin.y)
-                    } else {
-                        indicatorPoint = cursorPosition
-                    }
-                    let vm = IndicatorWindowManager.shared.show(nearPoint: indicatorPoint)
-                    // Keep the operation identity installed before starting
-                    // the controller. A preparation failure can transition
-                    // to a terminal state synchronously, and the delegate
-                    // callback must be able to clear this same VM.
-                    self.activeVm = vm
-                    vm.startRecording()
-                } else if !self.holdMode {
-                    // Second quick press: toggle off recording
-                    IndicatorWindowManager.shared.stopRecording()
-                    // Keep activeVm until indicatorDidFinish. The controller
-                    // may still be finalizing, transcribing, or uploading;
-                    // Escape must remain able to cancel that work.
-                }
-            }
-            // Schedule hold-mode flag after threshold
-            let workItem = DispatchWorkItem {
-                self.holdMode = true
-            }
-            self.holdWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + self.holdThreshold, execute: workItem)
-        }
-
-        // Handle key up for recording shortcut: end hold if in hold mode
-        KeyboardShortcuts.onKeyUp(for: .toggleRecord) {
-            // Cancel hold detection
-            self.holdWorkItem?.cancel()
-            self.holdWorkItem = nil
-            // Perform UI actions on the main actor
-            Task { @MainActor in
-                if self.holdMode {
-                    // End hold-to-record
-                    IndicatorWindowManager.shared.stopRecording()
-                    self.holdMode = false
-                }
-                // Tap-mode toggle off handled on keyDown
+        guard registerShortcuts else { return }
+        KeyboardShortcuts.onKeyDown(for: .toggleRecord) { [weak self] in
+            let sequence = Self.callbackSequence.next()
+            Task { @MainActor [weak self] in
+                self?.handleKeyDown(sequence: sequence)
             }
         }
-
-        KeyboardShortcuts.onKeyUp(for: .escape) {
-            // Run on the main actor to safely interact with actor-isolated methods
-            Task { @MainActor in
-                if self.activeVm != nil {
-                    IndicatorWindowManager.shared.stopForce()
-                }
+        KeyboardShortcuts.onKeyUp(for: .toggleRecord) { [weak self] in
+            let sequence = Self.callbackSequence.next()
+            Task { @MainActor [weak self] in
+                self?.handleKeyUp(sequence: sequence)
+            }
+        }
+        KeyboardShortcuts.onKeyUp(for: .escape) { [weak self] in
+            let sequence = Self.callbackSequence.next()
+            Task { @MainActor [weak self] in
+                self?.handleEscape(sequence: sequence)
             }
         }
         KeyboardShortcuts.disable(.escape)
     }
 
-    @MainActor
+    deinit {
+        holdCancellable?.cancel()
+    }
+
+    // MARK: Callback state machine
+
+    private func handleKeyDown(sequence: UInt64) {
+        guard accept(sequence) else { return }
+        cancelHold()
+        holdMode = false
+
+        if let token = activeToken {
+            // A quick second press toggles only the operation this indicator
+            // admitted. Processing phases use the same surface's cancel
+            // action instead of becoming a dead, disabled button.
+            guard sessionController.isReservationActive(token),
+                  activeVm?.operationToken == token
+            else { return }
+            keyDownSequence = sequence
+            indicatorManager.stopRecording(token: token)
+            return
+        }
+
+        // Reserve synchronously before showing the indicator or arming a
+        // timer. A rejected shortcut creates no timer, VM, or callback.
+        guard let token = sessionController.reserve(
+            source: .shortcut,
+            pasteOnCompletion: true
+        ) else {
+            keyDownSequence = nil
+            return
+        }
+
+        let point = indicatorPoint()
+        let viewModel = indicatorManager.show(
+            nearPoint: point,
+            sessionController: sessionController
+        )
+        activeToken = token
+        activeVm = viewModel
+        keyDownSequence = sequence
+        viewModel.startRecording(token: token)
+
+        let generation = UUID()
+        holdGeneration = generation
+        holdCancellable = holdScheduler({ [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleHoldTimer(token: token, generation: generation)
+            }
+        }, holdThreshold)
+    }
+
+    private func handleKeyUp(sequence: UInt64) {
+        guard accept(sequence),
+              let token = activeToken,
+              let downSequence = keyDownSequence,
+              sequence > downSequence,
+              sessionController.isReservationActive(token),
+              activeVm?.operationToken == token
+        else { return }
+
+        cancelHold()
+        keyDownSequence = nil
+        if holdMode {
+            holdMode = false
+            indicatorManager.stopRecording(token: token)
+        }
+        // Tap-mode already stopped on key-down. The operation remains owned
+        // by the token while finalizing/transcribing so Escape can cancel it.
+    }
+
+    private func handleEscape(sequence: UInt64) {
+        guard accept(sequence),
+              let token = activeToken,
+              sessionController.isReservationActive(token),
+              activeVm?.operationToken == token
+        else { return }
+        indicatorManager.stopForce(token: token)
+    }
+
+    private func handleHoldTimer(
+        token: SessionOperationToken,
+        generation: UUID
+    ) {
+        guard holdGeneration == generation,
+              activeToken == token,
+              sessionController.isReservationActive(token),
+              activeVm?.operationToken == token
+        else { return }
+        holdMode = true
+        holdCancellable = nil
+    }
+
+    private func accept(_ sequence: UInt64) -> Bool {
+        guard sequence > lastHandledSequence else { return false }
+        lastHandledSequence = sequence
+        return true
+    }
+
+    // MARK: Indicator lifecycle
+
     func indicatorDidFinish(_ viewModel: IndicatorViewModel) {
         guard activeVm === viewModel else { return }
-        holdWorkItem?.cancel()
-        holdWorkItem = nil
+        guard activeToken == viewModel.operationToken else { return }
+        cancelHold()
         holdMode = false
+        keyDownSequence = nil
+        holdGeneration = nil
+        activeToken = nil
         activeVm = nil
     }
 
+    // Deterministic seams used by the input unit tests. They still exercise
+    // the production state machine and do not register global shortcuts.
+    func handleKeyDownForTesting(sequence: UInt64) {
+        handleKeyDown(sequence: sequence)
+    }
+
+    func handleKeyUpForTesting(sequence: UInt64) {
+        handleKeyUp(sequence: sequence)
+    }
+
+    func fireHoldForTesting() {
+        holdCancellable = nil
+        guard let token = activeToken, let generation = holdGeneration else { return }
+        handleHoldTimer(token: token, generation: generation)
+    }
+
+    private func cancelHold() {
+        holdCancellable?.cancel()
+        holdCancellable = nil
+        holdGeneration = nil
+    }
+
+    private func indicatorPoint() -> NSPoint? {
+        let cursorPosition = FocusUtils.getCurrentCursorPosition()
+        if let caret = FocusUtils.getCaretRect(),
+           let screen = FocusUtils.getFocusedWindowScreen() {
+            return NSPoint(
+                x: caret.origin.x,
+                y: screen.frame.height - caret.origin.y
+            )
+        }
+        return cursorPosition
+    }
+
+    private static let defaultHoldScheduler: HoldScheduler = { callback, duration in
+        let workItem = DispatchWorkItem(block: callback)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + duration,
+            execute: workItem
+        )
+        return AnyCancellable { workItem.cancel() }
+    }
 }

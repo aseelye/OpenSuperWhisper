@@ -29,6 +29,11 @@ is needed for either the build or the default local provider.
 
 ## CI and release builds
 
-GitHub Actions uses the same `./run.sh build` path. For a signed distribution
-archive, use `notarize_app.sh` with the required Apple signing and notarization
-environment variables.
+GitHub Actions uses the same `./run.sh build` path. Release creation is
+separate from publishing: `make_release.sh` reads and verifies the committed
+project version, builds/notarizes it, and writes a manifest under
+`build/release/`. It does not edit project settings or mutate Git. Use
+`publish_release.sh --publish --confirm` only after the manifest has been
+reviewed and the checkout is clean and up to date with the origin default
+branch. See [release_build.md](release_build.md) for prerequisites, signing
+inputs, artifact names, and dry-run commands.

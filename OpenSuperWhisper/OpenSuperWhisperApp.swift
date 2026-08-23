@@ -61,22 +61,23 @@ class AppState: ObservableObject {
     }
 
     init() {
-        self.hasCompletedOnboarding = AppPreferences.shared.hasCompletedOnboarding
+        self.hasCompletedOnboarding = ProcessInfo.processInfo.arguments.contains(
+            "--open-super-whisper-ui-test"
+        ) || AppPreferences.shared.hasCompletedOnboarding
     }
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var statusItem: NSStatusItem?
-    private var mainWindow: NSWindow?
+    private var uiTestWindow: NSWindow?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
-        
         setupStatusBarItem()
-        
-        if let window = NSApplication.shared.windows.first {
-            self.mainWindow = window
-            
-            window.delegate = self
+        bindWindowDelegates()
+        DispatchQueue.main.async {
+            if ProcessInfo.processInfo.arguments.contains("--open-super-whisper-ui-test") {
+                self.showMainWindow()
+            }
         }
     }
     
@@ -118,18 +119,69 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
     
     func showMainWindow() {
-        NSApplication.shared.setActivationPolicy(.regular)
-        
-        if let window = mainWindow {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.regular)
+
+        // WindowGroup creation is asynchronous for this menu-bar app. In
+        // UI-test mode, always own a concrete window so the test target has
+        // an accessible surface even when the scene has not materialized (or
+        // has restored an invisible window) yet.
+        if ProcessInfo.processInfo.arguments.contains("--open-super-whisper-ui-test") {
+            showUITestWindow(application: application)
+            return
+        }
+
+        if let window = currentMainWindow() {
+            window.delegate = self
             if !window.isVisible {
                 window.makeKeyAndOrderFront(nil)
             }
             window.orderFrontRegardless()
-            NSApplication.shared.activate(ignoringOtherApps: true)
+            application.activate(ignoringOtherApps: true)
         } else {
             let url = URL(string: "openSuperWhisper://openMainWindow")!
             NSWorkspace.shared.open(url)
         }
+    }
+
+    private func showUITestWindow(application: NSApplication) {
+        if let window = uiTestWindow {
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            application.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let hostingController = NSHostingController(
+            rootView: ContentView().environmentObject(AppState())
+        )
+        let window = NSWindow(contentViewController: hostingController)
+        window.title = "OpenSuperWhisper"
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.setContentSize(NSSize(width: 450, height: 650))
+        window.isRestorable = false
+        window.center()
+        window.delegate = self
+        uiTestWindow = window
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        application.activate(ignoringOtherApps: true)
+    }
+
+    /// WindowGroup may close and recreate its window. Resolve the current
+    /// eligible window at action time instead of retaining the launch-time
+    /// `windows.first` pointer.
+    private func currentMainWindow() -> NSWindow? {
+        let windows = NSApplication.shared.windows
+        return windows.first(where: {
+            !$0.isMiniaturized && $0.isVisible && !($0 is NSPanel)
+        }) ?? windows.first(where: { !($0 is NSPanel) && $0.contentView != nil })
+    }
+
+    private func bindWindowDelegates() {
+        NSApplication.shared.windows
+            .filter { !($0 is NSPanel) }
+            .forEach { $0.delegate = self }
     }
 }
 
