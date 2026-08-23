@@ -54,6 +54,7 @@ final class OpenSuperWhisperUITests: XCTestCase {
 
     private func launchIsolatedApp() -> XCUIApplication {
         let app = XCUIApplication()
+        let root = isolatedRoot()
         app.launchArguments = [
             "--open-super-whisper-ui-test",
             "-ApplePersistenceIgnoreState",
@@ -62,7 +63,8 @@ final class OpenSuperWhisperUITests: XCTestCase {
         app.launchEnvironment = [
             "OPEN_SUPER_WHISPER_UI_TEST": "1",
             "OPEN_SUPER_WHISPER_UI_TEST_ID": UUID().uuidString,
-            "HOME": isolatedRoot().path
+            "OPEN_SUPER_WHISPER_UI_TEST_STORAGE_ROOT": root.path,
+            "HOME": root.path
         ]
         app.launch()
         launchedApps.append(app)

@@ -40,12 +40,90 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
         lhs.id == rhs.id
     }
 
+    /// The UI-test lane supplies a storage root explicitly at process launch.
+    /// Requiring both the opt-in launch argument and marker keeps an arbitrary
+    /// environment variable from changing normal application persistence.
+    static let uiTestStorageRootEnvironmentKey = "OPEN_SUPER_WHISPER_UI_TEST_STORAGE_ROOT"
+
+    private static let uiTestLaunchArgument = "--open-super-whisper-ui-test"
+    private static let uiTestEnvironmentKey = "OPEN_SUPER_WHISPER_UI_TEST"
+
     static var applicationDirectory: URL {
-        let applicationSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first ?? FileManager.default.temporaryDirectory
-        let bundleIdentifier = Bundle.main.bundleIdentifier ?? "OpenSuperWhisper"
-        return applicationSupport.appendingPathComponent(bundleIdentifier, isDirectory: true)
+        resolvedApplicationDirectory(
+            arguments: ProcessInfo.processInfo.arguments,
+            environment: ProcessInfo.processInfo.environment
+        )
+    }
+
+    /// Resolves the app-owned persistence directory without reading or
+    /// creating anything on disk. The injectable inputs make the UI-test
+    /// boundary deterministic while keeping the production fallback identical
+    /// to the historical Application Support location.
+    static func resolvedApplicationDirectory(
+        arguments: [String],
+        environment: [String: String],
+        applicationSupportDirectory: URL? = nil,
+        bundleIdentifier: String? = nil
+    ) -> URL {
+        let resolvedBundleIdentifier = bundleIdentifier
+            ?? Bundle.main.bundleIdentifier
+            ?? "OpenSuperWhisper"
+
+        if let storageRoot = uiTestStorageRoot(
+            arguments: arguments,
+            environment: environment
+        ) {
+            return storageRoot.appendingPathComponent(
+                resolvedBundleIdentifier,
+                isDirectory: true
+            )
+        }
+
+        let applicationSupport = applicationSupportDirectory
+            ?? FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first
+            ?? FileManager.default.temporaryDirectory
+        return applicationSupport.appendingPathComponent(
+            resolvedBundleIdentifier,
+            isDirectory: true
+        )
+    }
+
+    /// Captures temporary files under the same isolated root for UI tests so
+    /// startup reconciliation cannot scan the shared process temp directory.
+    /// Production keeps its existing shared temporary location.
+    static var temporaryCaptureDirectory: URL {
+        if uiTestStorageRoot(
+            arguments: ProcessInfo.processInfo.arguments,
+            environment: ProcessInfo.processInfo.environment
+        ) != nil {
+            return applicationDirectory.appendingPathComponent(
+                "temporary-captures",
+                isDirectory: true
+            )
+        }
+        return FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenSuperWhisper", isDirectory: true)
+    }
+
+    private static func uiTestStorageRoot(
+        arguments: [String],
+        environment: [String: String]
+    ) -> URL? {
+        guard arguments.contains(uiTestLaunchArgument),
+              environment[uiTestEnvironmentKey] == "1",
+              let rawRoot = environment[uiTestStorageRootEnvironmentKey]?.trimmingCharacters(
+                  in: .whitespacesAndNewlines
+              ),
+              !rawRoot.isEmpty else {
+            return nil
+        }
+
+        let root = URL(fileURLWithPath: rawRoot, isDirectory: true).standardizedFileURL
+        guard root.isFileURL, root.path != "/" else { return nil }
+        return root
     }
 
     static var recordingsDirectory: URL {
@@ -165,8 +243,7 @@ final class RecordingStore: ObservableObject {
         let resolvedRecoveryDirectory = recoveryDirectory
             ?? defaultApplicationDirectory.appendingPathComponent("Recovery", isDirectory: true)
         let resolvedTemporaryDirectory = temporaryCaptureDirectory
-            ?? FileManager.default.temporaryDirectory
-                .appendingPathComponent("OpenSuperWhisper", isDirectory: true)
+            ?? Recording.temporaryCaptureDirectory
         let resolvedQuarantineDirectory = quarantineDirectory
             ?? resolvedRecordingsDirectory.appendingPathComponent(
                 ".pending-deletions",
