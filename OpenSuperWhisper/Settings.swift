@@ -65,8 +65,17 @@ final class SettingsViewModel: ObservableObject {
 
     @Published private(set) var appleSpeechAssetStatus: AppleSpeechAssetStatus?
 
+    @Published var recordingRetentionSelection: RecordingRetentionOption
+    @Published var customRecordingRetentionDays: String
+    @Published private(set) var retentionConfirmationPreview: RecordingRetentionPreview?
+    @Published private(set) var retentionConfirmationPolicy: RecordingRetentionPolicy?
+    @Published var retentionValidationMessage: String?
+    @Published var isRetentionConfirmationPresented = false
+
     private let apiKeyStore = OpenAIAPIKeyStore.shared
     private let assetManager: any AppleSpeechAssetManaging
+    let retentionCoordinator: RecordingRetentionCoordinator
+    private let preferences: AppPreferences
     private var cancellables = Set<AnyCancellable>()
     private var refreshTask: Task<Void, Never>?
     private var statusTask: Task<Void, Never>?
@@ -76,9 +85,20 @@ final class SettingsViewModel: ObservableObject {
     private var preparationRequestID: AppleSpeechAssetRequestID?
     private var applyingResolvedLocale = false
 
-    init(assetManager: (any AppleSpeechAssetManaging)? = nil) {
+    init(
+        assetManager: (any AppleSpeechAssetManaging)? = nil,
+        recordingStore: RecordingStore? = nil,
+        retentionCoordinator: RecordingRetentionCoordinator? = nil,
+        preferences: AppPreferences = .shared
+    ) {
         let resolvedAssetManager = assetManager ?? AppleSpeechAssetManager.shared
-        let prefs = AppPreferences.shared
+        let prefs = preferences
+        let resolvedStore = recordingStore ?? .shared
+        let resolvedRetentionCoordinator = retentionCoordinator
+            ?? RecordingRetentionCoordinator(
+                recordingStore: resolvedStore,
+                preferences: prefs
+            )
         self.transcriptionBackend = prefs.transcriptionBackend
         self.selectedLocaleIdentifier = prefs.localeIdentifier
         self.availableLocaleIdentifiers = LanguageUtil.availableLocaleIdentifiers
@@ -88,8 +108,17 @@ final class SettingsViewModel: ObservableObject {
         self.debugMode = prefs.debugMode
         self.openAIRetryCount = min(max(prefs.openAIRetryCount, 0), 5)
         self.assetManager = resolvedAssetManager
+        self.preferences = prefs
+        self.retentionCoordinator = resolvedRetentionCoordinator
         self.appleSpeechAssetStatus = nil
         self.openAIAPIKey = (try? apiKeyStore.loadKey()) ?? ""
+        let savedRetentionPolicy = prefs.recordingRetentionPolicy
+        self.recordingRetentionSelection = RecordingRetentionOption.option(for: savedRetentionPolicy)
+        self.customRecordingRetentionDays = String(
+            RecordingRetentionOption.customDays(for: savedRetentionPolicy)
+                ?? savedRetentionPolicy.dayCount
+                ?? RecordingRetentionPolicy.default.dayCount!
+        )
 
         if let concreteManager = resolvedAssetManager as? AppleSpeechAssetManager {
             concreteManager.$currentStatus
@@ -256,6 +285,106 @@ final class SettingsViewModel: ObservableObject {
         apiKeyStatusIsError = false
     }
 
+    var selectedRecordingRetentionPolicy: RecordingRetentionPolicy? {
+        let trimmed = customRecordingRetentionDays.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard recordingRetentionSelection != .custom || !trimmed.isEmpty else { return nil }
+        if let fixedPolicy = recordingRetentionSelection.fixedPolicy {
+            return fixedPolicy
+        }
+        guard let value = Int(trimmed) else { return nil }
+        guard (RecordingRetentionPolicy.minimumDays...RecordingRetentionPolicy.maximumDays).contains(value) else {
+            return nil
+        }
+        return .days(value)
+    }
+
+    var retentionConfirmationMessage: String {
+        guard let preview = retentionConfirmationPreview,
+              let policy = retentionConfirmationPolicy else {
+            return "This change removes recordings and their audio, transcript, and history entry."
+        }
+        return RecordingRetentionCoordinator.confirmationMessage(
+            preview: preview,
+            policy: policy
+        )
+    }
+
+    /// Requests a retention change. Destructive finite changes are previewed
+    /// first and remain unpersisted until `confirmRetentionChange()` runs.
+    func submitRecordingRetentionChange() {
+        retentionValidationMessage = nil
+        guard let policy = selectedRecordingRetentionPolicy else {
+            retentionValidationMessage = "Enter a whole number of days from 1 to 3650."
+            return
+        }
+
+        let normalized = policy.normalized
+        if recordingRetentionSelection == .custom,
+           let days = normalized.dayCount {
+            customRecordingRetentionDays = String(days)
+        }
+
+        let current = preferences.recordingRetentionPolicy.normalized
+        guard normalized != current else { return }
+
+        if normalized.isForever || !isDestructiveRetentionChange(from: current, to: normalized) {
+            preferences.recordingRetentionPolicy = normalized
+            retentionCoordinator.requestConfirmedChange(normalized)
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let preview = await retentionCoordinator.preview(policy: normalized)
+            guard preview.error == nil else {
+                retentionValidationMessage = preview.error?.localizedDescription
+                return
+            }
+            retentionConfirmationPolicy = normalized
+            retentionConfirmationPreview = preview
+            isRetentionConfirmationPresented = true
+        }
+    }
+
+    func confirmRetentionChange() {
+        guard let policy = retentionConfirmationPolicy else { return }
+        isRetentionConfirmationPresented = false
+        retentionConfirmationPolicy = nil
+        retentionConfirmationPreview = nil
+        preferences.recordingRetentionPolicy = policy
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            _ = await retentionCoordinator.runAfterConfirmedChange(policy: policy)
+        }
+    }
+
+    func cancelRetentionChange() {
+        let saved = preferences.recordingRetentionPolicy
+        recordingRetentionSelection = RecordingRetentionOption.option(for: saved)
+        customRecordingRetentionDays = String(
+            RecordingRetentionOption.customDays(for: saved)
+                ?? saved.dayCount
+                ?? RecordingRetentionPolicy.default.dayCount!
+        )
+        retentionConfirmationPolicy = nil
+        retentionConfirmationPreview = nil
+        isRetentionConfirmationPresented = false
+    }
+
+    private func isDestructiveRetentionChange(
+        from oldPolicy: RecordingRetentionPolicy,
+        to newPolicy: RecordingRetentionPolicy
+    ) -> Bool {
+        switch (oldPolicy.normalized, newPolicy.normalized) {
+        case (.forever, .days):
+            return true
+        case let (.days(oldDays), .days(newDays)):
+            return newDays < oldDays
+        case (.days, .forever), (.forever, .forever):
+            return false
+        }
+    }
+
     private func refreshAppleSpeechAssetStatus() {
         statusTask?.cancel()
         let requestID = AppleSpeechAssetRequestID()
@@ -345,6 +474,18 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedTab = 0
 
+    init(
+        recordingStore: RecordingStore? = nil,
+        retentionCoordinator: RecordingRetentionCoordinator? = nil
+    ) {
+        _viewModel = StateObject(
+            wrappedValue: SettingsViewModel(
+                recordingStore: recordingStore,
+                retentionCoordinator: retentionCoordinator
+            )
+        )
+    }
+
     var body: some View {
         TabView(selection: $selectedTab) {
             transcriptionSettings
@@ -383,6 +524,34 @@ struct SettingsView: View {
             }
         }
         .onDisappear { viewModel.cancelAssetWork() }
+        .onChange(of: viewModel.isRetentionConfirmationPresented) { _, isPresented in
+            if !isPresented, viewModel.retentionConfirmationPolicy != nil {
+                viewModel.cancelRetentionChange()
+            }
+        }
+        .alert(
+            "Delete recordings now?",
+            isPresented: $viewModel.isRetentionConfirmationPresented,
+            presenting: viewModel.retentionConfirmationPolicy
+        ) { _ in
+            Button("Delete now", role: .destructive) {
+                viewModel.confirmRetentionChange()
+            }
+            Button("Cancel", role: .cancel) {
+                viewModel.cancelRetentionChange()
+            }
+        } message: { _ in
+            Text(viewModel.retentionConfirmationMessage)
+        }
+        .alert(
+            "Retention setting",
+            isPresented: Binding(
+                get: { viewModel.retentionValidationMessage != nil },
+                set: { if !$0 { viewModel.retentionValidationMessage = nil } }
+            ),
+            actions: { Button("OK", role: .cancel) {} },
+            message: { Text(viewModel.retentionValidationMessage ?? "The retention setting is invalid.") }
+        )
     }
 
     private var transcriptionSettings: some View {
@@ -538,8 +707,48 @@ struct SettingsView: View {
     private var generalSettings: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                settingsSection("History", caption: "Timing details stay out of copied and pasted transcript text.") {
+                settingsSection(
+                    "History",
+                    caption: "Timing details stay out of copied and pasted transcript text."
+                ) {
                     Toggle("Show timing details in history", isOn: $viewModel.showTimingDetailsInHistory)
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Keep recordings")
+                            .font(.subheadline.weight(.medium))
+                        Text("Audio, transcript, and the history entry are deleted together when a recording expires.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Picker("Keep recordings", selection: $viewModel.recordingRetentionSelection) {
+                                ForEach(RecordingRetentionOption.allCases) { option in
+                                    Text(option.title).tag(option)
+                                }
+                            }
+                            .labelsHidden()
+
+                            if viewModel.recordingRetentionSelection == .custom {
+                                TextField("Days", text: $viewModel.customRecordingRetentionDays)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 72)
+                                    .onSubmit { viewModel.submitRecordingRetentionChange() }
+                                Text("days")
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+                            Button("Apply") {
+                                viewModel.submitRecordingRetentionChange()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .accessibilityElement(children: .contain)
+                        .accessibilityLabel("Keep recordings")
+                    }
                 }
 
                 settingsSection("Diagnostics") {

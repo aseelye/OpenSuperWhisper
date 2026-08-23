@@ -67,6 +67,24 @@ class PermissionsManager: ObservableObject {
         }
     }
 
+    /// Requests trust for this exact signed process. Opening the Privacy pane
+    /// alone can leave macOS showing a stale entry for an older build with the
+    /// same display name, while this call registers the current designated
+    /// requirement with TCC.
+    func requestAccessibilityPermission() {
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        let granted = AXIsProcessTrustedWithOptions([
+            promptKey: true
+        ] as CFDictionary)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.isAccessibilityPermissionGranted = granted
+            if !granted {
+                self?.openSystemPreferences(for: .accessibility)
+            }
+        }
+    }
+
     func requestMicrophonePermissionOrOpenSystemPreferences() {
 
         let status = AVCaptureDevice.authorizationStatus(for: .audio)

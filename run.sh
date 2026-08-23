@@ -43,7 +43,7 @@ sign_debug_app_if_possible() {
     echo "Signing Debug app for stable macOS privacy permissions..."
     codesign --force --deep --sign "$signing_identity" \
         --entitlements "$PWD/OpenSuperWhisper/OpenSuperWhisper.entitlements" \
-        --identifier ru.starmel.OpenSuperWhisper "$app_bundle"
+        --identifier net.mdo.OpenSuperWhisper "$app_bundle"
     codesign --verify --deep --strict "$app_bundle"
 }
 

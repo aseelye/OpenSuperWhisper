@@ -14,10 +14,21 @@ extension FileManager: AppPreferencesFileOperations {}
 struct UserDefault<T> {
     let key: String
     let defaultValue: T
+    let defaults: UserDefaults
+
+    init(
+        key: String,
+        defaultValue: T,
+        defaults: UserDefaults = .standard
+    ) {
+        self.key = key
+        self.defaultValue = defaultValue
+        self.defaults = defaults
+    }
 
     var wrappedValue: T {
-        get { UserDefaults.standard.object(forKey: key) as? T ?? defaultValue }
-        set { UserDefaults.standard.set(newValue, forKey: key) }
+        get { defaults.object(forKey: key) as? T ?? defaultValue }
+        set { defaults.set(newValue, forKey: key) }
     }
 }
 
@@ -37,12 +48,29 @@ final class AppPreferences {
         static let playSoundOnRecordStart = "playSoundOnRecordStart"
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
         static let openAIRetryCount = "openAIRetryCount"
+        static let recordingRetentionDays = "recordingRetentionDays"
+        static let recordingRetentionNeedsInitialConfirmation =
+            "recordingRetentionNeedsInitialConfirmation"
+        static let recordingRetentionLastSuccessfulSweep =
+            "recordingRetentionLastSuccessfulSweep"
     }
 
+    // These keys are intentionally stable. The identity migration uses the
+    // exact confirmation key when it detects an existing installation.
+    static let recordingRetentionDaysKey = Key.recordingRetentionDays
+    static let recordingRetentionNeedsInitialConfirmationKey =
+        Key.recordingRetentionNeedsInitialConfirmation
+    static let recordingRetentionLastSuccessfulSweepKey =
+        Key.recordingRetentionLastSuccessfulSweep
+
     /// This is deliberately the one exact path removed by the migration. Do
-    /// not replace it with a recursive Application Support cleanup.
-    static let legacyWhisperModelsDirectory = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/ru.starmel.OpenSuperWhisper/whisper-models", isDirectory: true)
+    /// not replace it with a recursive Application Support cleanup. The
+    /// active application directory is used so the preference layer never
+    /// embeds the pre-identity bundle identifier.
+    static let legacyWhisperModelsDirectory = Recording.applicationDirectory
+        .appendingPathComponent("whisper-models", isDirectory: true)
+
+    private let defaults: UserDefaults
 
     @UserDefault(key: Key.transcriptionBackend, defaultValue: TranscriptionBackend.appleSpeech.rawValue)
     private var transcriptionBackendRawValue: String
@@ -110,8 +138,113 @@ final class AppPreferences {
     @UserDefault(key: Key.openAIRetryCount, defaultValue: 1)
     var openAIRetryCount: Int
 
-    private init() {
-        Self.performLegacyMigration()
+    @UserDefault(key: Key.recordingRetentionDays, defaultValue: 7)
+    private var recordingRetentionDaysRawValue: Int
+
+    /// The selected policy. `0` is the on-disk sentinel for Forever; a
+    /// missing key intentionally resolves to the seven-day default.
+    var recordingRetentionPolicy: RecordingRetentionPolicy {
+        get {
+            let rawValue = recordingRetentionDaysRawValue
+            guard rawValue != 0 else { return .forever }
+            let normalized = RecordingRetentionPolicy(days: rawValue).normalized
+            if case let .days(days) = normalized, days != rawValue {
+                recordingRetentionDaysRawValue = days
+            }
+            return normalized
+        }
+        set {
+            let normalized = newValue.normalized
+            recordingRetentionDaysRawValue = normalized.dayCount ?? 0
+        }
+    }
+
+    /// Raw integer form retained for migration/tests and for callers that
+    /// need to inspect the Forever sentinel without decoding the enum.
+    var recordingRetentionDays: Int {
+        get {
+            if case .forever = recordingRetentionPolicy { return 0 }
+            return recordingRetentionPolicy.dayCount ?? RecordingRetentionPolicy.minimumDays
+        }
+        set {
+            if newValue == 0 {
+                recordingRetentionPolicy = .forever
+            } else {
+                recordingRetentionPolicy = .days(newValue)
+            }
+        }
+    }
+
+    @UserDefault(key: Key.recordingRetentionNeedsInitialConfirmation, defaultValue: false)
+    var recordingRetentionNeedsInitialConfirmation: Bool
+
+    /// `nil` means the retention coordinator has not completed a successful
+    /// sweep yet. Dates are stored directly in UserDefaults for portability.
+    var recordingRetentionLastSuccessfulSweep: Date? {
+        get { defaults.object(forKey: Key.recordingRetentionLastSuccessfulSweep) as? Date }
+        set {
+            if let newValue {
+                defaults.set(newValue, forKey: Key.recordingRetentionLastSuccessfulSweep)
+            } else {
+                defaults.removeObject(forKey: Key.recordingRetentionLastSuccessfulSweep)
+            }
+        }
+    }
+
+    /// A production instance uses `.standard`; tests may pass an isolated
+    /// suite and skip migration when they only exercise preference behavior.
+    init(
+        defaults: UserDefaults = .standard,
+        performLegacyMigration: Bool = true
+    ) {
+        self.defaults = defaults
+
+        _transcriptionBackendRawValue = UserDefault(
+            key: Key.transcriptionBackend,
+            defaultValue: TranscriptionBackend.appleSpeech.rawValue,
+            defaults: defaults
+        )
+        _storedLocaleIdentifier = UserDefault(
+            key: Key.localeIdentifier,
+            defaultValue: LanguageUtil.defaultLocaleIdentifier,
+            defaults: defaults
+        )
+        _recognitionContext = UserDefault(
+            key: Key.recognitionContext,
+            defaultValue: "",
+            defaults: defaults
+        )
+        _showTimingDetailsInHistory = UserDefault(
+            key: Key.showTimingDetailsInHistory,
+            defaultValue: false,
+            defaults: defaults
+        )
+        _debugMode = UserDefault(key: Key.debugMode, defaultValue: false, defaults: defaults)
+        _playSoundOnRecordStart = UserDefault(
+            key: Key.playSoundOnRecordStart,
+            defaultValue: false,
+            defaults: defaults
+        )
+        _hasCompletedOnboarding = UserDefault(
+            key: Key.hasCompletedOnboarding,
+            defaultValue: false,
+            defaults: defaults
+        )
+        _openAIRetryCount = UserDefault(key: Key.openAIRetryCount, defaultValue: 1, defaults: defaults)
+        _recordingRetentionDaysRawValue = UserDefault(
+            key: Key.recordingRetentionDays,
+            defaultValue: 7,
+            defaults: defaults
+        )
+        _recordingRetentionNeedsInitialConfirmation = UserDefault(
+            key: Key.recordingRetentionNeedsInitialConfirmation,
+            defaultValue: false,
+            defaults: defaults
+        )
+
+        if performLegacyMigration {
+            Self.performLegacyMigration(defaults: defaults)
+        }
     }
 
     /// Performs the one-time migration from whisper.cpp preferences and
@@ -201,8 +334,8 @@ final class AppPreferences {
         return true
     }
 
-    private static func performLegacyMigration() {
-        _ = migrateLegacyPreferencesIfNeeded()
+    private static func performLegacyMigration(defaults: UserDefaults) {
+        _ = migrateLegacyPreferencesIfNeeded(defaults: defaults)
     }
 
     private static func isPersistableLocaleIdentifier(_ identifier: String) -> Bool {

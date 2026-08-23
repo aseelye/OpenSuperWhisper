@@ -216,6 +216,7 @@ struct ContentView: View {
     @ObservedObject private var sessionController: DictationSessionController
     @ObservedObject private var recordingStore: RecordingStore
     @StateObject private var permissionsManager = PermissionsManager()
+    @StateObject private var retentionCoordinator: RecordingRetentionCoordinator
     @State private var isSettingsPresented = false
     @State private var searchText = ""
     @State private var showDeleteConfirmation = false
@@ -223,6 +224,9 @@ struct ContentView: View {
     @State private var showDeleteAllRecoveryConfirmation = false
     @State private var isDeletingAllRecovery = false
     @State private var historyActionMessage: String?
+    @State private var initialRetentionPreview: RecordingRetentionPreview?
+    @State private var showInitialRetentionConfirmation = false
+    @State private var isPreparingInitialRetentionConfirmation = false
 
     init(
         sessionController: DictationSessionController? = nil,
@@ -238,6 +242,9 @@ struct ContentView: View {
         )
         _sessionController = ObservedObject(wrappedValue: model.sessionController)
         _recordingStore = ObservedObject(wrappedValue: model.recordingStore)
+        _retentionCoordinator = StateObject(
+            wrappedValue: RecordingRetentionCoordinator(recordingStore: model.recordingStore)
+        )
     }
 
     private var filteredRecordings: [Recording] {
@@ -290,7 +297,12 @@ struct ContentView: View {
             actions: { Button("OK", role: .cancel) {} },
             message: { Text(historyActionMessage ?? "History needs repair.") }
         )
-        .sheet(isPresented: $isSettingsPresented) { SettingsView() }
+        .sheet(isPresented: $isSettingsPresented) {
+            SettingsView(
+                recordingStore: recordingStore,
+                retentionCoordinator: retentionCoordinator
+            )
+        }
     }
 
     @ViewBuilder
@@ -340,6 +352,70 @@ struct ContentView: View {
                 }
                 .ignoresSafeArea()
             }
+        }
+        .onAppear {
+            retentionCoordinator.start()
+            handleHistoryBecameUsable()
+        }
+        .onDisappear {
+            retentionCoordinator.stop()
+        }
+        .onChange(of: recordingStore.status) { _, status in
+            guard status.isAvailable else { return }
+            handleHistoryBecameUsable()
+        }
+        .alert(
+            "Review recording retention",
+            isPresented: $showInitialRetentionConfirmation
+        ) {
+            Button("Keep current policy", role: .destructive) {
+                let now = Date()
+                Task { @MainActor in
+                    _ = await retentionCoordinator.approveInitialConfirmation(now: now)
+                    initialRetentionPreview = nil
+                }
+            }
+            Button("Keep Forever") {
+                let now = Date()
+                Task { @MainActor in
+                    _ = await retentionCoordinator.declineInitialConfirmation(now: now)
+                    initialRetentionPreview = nil
+                }
+            }
+            Button("Later", role: .cancel) {
+                retentionCoordinator.cancelInitialConfirmation()
+            }
+        } message: {
+            Text(initialRetentionConfirmationMessage)
+        }
+    }
+
+    private var initialRetentionConfirmationMessage: String {
+        let policy = AppPreferences.shared.recordingRetentionPolicy
+        guard let preview = initialRetentionPreview else {
+            return "Review how long recordings are kept. Audio, transcript, and the history entry are deleted together when a recording expires. Future recordings will be deleted after the selected retention period, even when none are eligible today."
+        }
+        let currentMessage = RecordingRetentionCoordinator.confirmationMessage(
+            preview: preview,
+            policy: policy
+        )
+        return "\(currentMessage) This setting applies to future recordings too."
+    }
+
+    private func handleHistoryBecameUsable() {
+        guard recordingStore.status.isAvailable else { return }
+        retentionCoordinator.historyDidLoad()
+        guard AppPreferences.shared.recordingRetentionNeedsInitialConfirmation,
+              !showInitialRetentionConfirmation,
+              !isPreparingInitialRetentionConfirmation else { return }
+
+        isPreparingInitialRetentionConfirmation = true
+        let policy = AppPreferences.shared.recordingRetentionPolicy
+        Task { @MainActor in
+            let preview = await retentionCoordinator.preview(policy: policy)
+            isPreparingInitialRetentionConfirmation = false
+            initialRetentionPreview = preview.error == nil ? preview : nil
+            showInitialRetentionConfirmation = true
         }
     }
 
@@ -808,7 +884,7 @@ struct PermissionsView: View {
                 isGranted: permissionsManager.isAccessibilityPermissionGranted,
                 title: "Accessibility Access",
                 description: "Required for global keyboard shortcuts",
-                action: { permissionsManager.openSystemPreferences(for: .accessibility) }
+                action: { permissionsManager.requestAccessibilityPermission() }
             )
             Spacer()
         }

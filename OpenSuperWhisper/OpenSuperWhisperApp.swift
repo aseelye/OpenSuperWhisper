@@ -10,14 +10,18 @@ import SwiftUI
 import AppKit
 
 @main
+@MainActor
 struct OpenSuperWhisperApp: App {
-    @StateObject private var appState = AppState()
+    @State private var startupOutcome: ForkIdentityMigrationOutcome
+    @StateObject private var appState: AppState
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
         WindowGroup {
             Group {
-                if !appState.hasCompletedOnboarding {
+                if let issue = startupOutcome.issue {
+                    ForkIdentityStartupView(issue: issue, retry: retryStartup)
+                } else if !appState.hasCompletedOnboarding {
                     OnboardingView()
                 } else {
                     ContentView()
@@ -36,13 +40,28 @@ struct OpenSuperWhisperApp: App {
     }
 
     init() {
+        // This must remain the first startup operation. AppState, the
+        // preferences singleton, shortcuts, and recording stores are created
+        // only after the identity migration has either completed or been
+        // explicitly skipped for an isolated UI-test launch.
+        let outcome = ForkIdentityMigrator().migrate()
+        _startupOutcome = State(initialValue: outcome)
+        _appState = StateObject(wrappedValue: AppState(startupOutcome: outcome))
+
+        initializeRuntime(for: outcome)
+    }
+
+    private func initializeRuntime(for outcome: ForkIdentityMigrationOutcome) {
+        guard outcome.canStartApplication else { return }
+
         _ = ShortcutManager.shared
 
         // Existing installs keep their completed-onboarding state. Once the
         // preference migration has selected Apple Speech, warm its locale
         // asset in the background so the first dictation is ready without
-        // showing onboarding again. The manager owns reservations and is
-        // idempotent for an already-installed locale.
+        // showing onboarding again. UI-test launches deliberately avoid the
+        // production preferences domain as well as identity migration.
+        guard case .success = outcome else { return }
         let preferences = AppPreferences.shared
         if preferences.hasCompletedOnboarding,
            preferences.transcriptionBackend == .appleSpeech {
@@ -51,22 +70,94 @@ struct OpenSuperWhisperApp: App {
             }
         }
     }
+
+    private func retryStartup() {
+        let outcome = ForkIdentityMigrator().migrate()
+        if outcome.canStartApplication {
+            appState.activateAfterStartup(outcome)
+            initializeRuntime(for: outcome)
+        }
+        startupOutcome = outcome
+    }
 }
 
-class AppState: ObservableObject {
+@MainActor
+final class AppState: ObservableObject {
     @Published var hasCompletedOnboarding: Bool {
         didSet {
+            guard startupIsReady else { return }
             AppPreferences.shared.hasCompletedOnboarding = hasCompletedOnboarding
         }
     }
 
-    init() {
-        self.hasCompletedOnboarding = ProcessInfo.processInfo.arguments.contains(
-            "--open-super-whisper-ui-test"
+    private var startupIsReady: Bool
+
+    convenience init() {
+        self.init(startupOutcome: .success(ForkIdentityMigrationReport()))
+    }
+
+    init(startupOutcome: ForkIdentityMigrationOutcome) {
+        self.startupIsReady = startupOutcome.canStartApplication
+        if startupOutcome.canStartApplication {
+            self.hasCompletedOnboarding = ProcessInfo.processInfo.arguments.contains(
+                ForkIdentityMigrator.uiTestLaunchArgument
+            ) || AppPreferences.shared.hasCompletedOnboarding
+        } else {
+            // A blocked launch must not read or create the production
+            // preferences singleton. This inert state exists only so the App
+            // can present the recovery screen while the user retries.
+            self.hasCompletedOnboarding = false
+        }
+    }
+
+    func activateAfterStartup(_ outcome: ForkIdentityMigrationOutcome) {
+        guard outcome.canStartApplication, !startupIsReady else { return }
+        startupIsReady = true
+        hasCompletedOnboarding = ProcessInfo.processInfo.arguments.contains(
+            ForkIdentityMigrator.uiTestLaunchArgument
         ) || AppPreferences.shared.hasCompletedOnboarding
     }
 }
 
+/// Minimal recovery surface for an identity conflict or filesystem failure.
+/// No normal app view is composed while this screen is visible.
+@MainActor
+private struct ForkIdentityStartupView: View {
+    let issue: ForkIdentityMigrationIssue
+    let retry: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: issue.isConflict ? "externaldrive.badge.exclamationmark" : "exclamationmark.triangle")
+                .font(.system(size: 34))
+                .foregroundStyle(.orange)
+            Text(issue.isConflict ? "Resolve OpenSuperWhisper storage" : "OpenSuperWhisper needs attention")
+                .font(.headline)
+            Text(issue.message)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 400)
+
+            HStack(spacing: 10) {
+                Button("Retry", action: retry)
+                    .keyboardShortcut(.defaultAction)
+                Button("Reveal folders") {
+                    NSWorkspace.shared.activateFileViewerSelecting([
+                        issue.legacyDirectory,
+                        issue.currentDirectory
+                    ])
+                }
+                Button("Quit") {
+                    NSApplication.shared.terminate(nil)
+                }
+            }
+        }
+        .padding(28)
+        .frame(width: 450, height: 300)
+    }
+}
+
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var statusItem: NSStatusItem?
     private var uiTestWindow: NSWindow?
@@ -153,7 +244,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
 
         let hostingController = NSHostingController(
-            rootView: ContentView().environmentObject(AppState())
+            rootView: ContentView().environmentObject(
+                AppState(startupOutcome: .skippedForUITest)
+            )
         )
         let window = NSWindow(contentViewController: hostingController)
         window.title = "OpenSuperWhisper"

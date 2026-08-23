@@ -421,6 +421,21 @@ test_verify_never_publishes() {
     pass "build and verification paths never commit, tag, push, or create releases"
 }
 
+test_fork_identity_contract() {
+    PROJECT_FILE="$SCRIPT_ROOT/OpenSuperWhisper.xcodeproj/project.pbxproj"
+    RUN_SCRIPT="$SCRIPT_ROOT/run.sh"
+    CAPTURE_SOURCE="$SCRIPT_ROOT/OpenSuperWhisper/AudioCaptureService.swift"
+    assert_contains 'PRODUCT_BUNDLE_IDENTIFIER = net.mdo.OpenSuperWhisper;' "$PROJECT_FILE"
+    assert_contains 'PRODUCT_BUNDLE_IDENTIFIER = net.mdo.OpenSuperWhisperTests;' "$PROJECT_FILE"
+    assert_contains 'PRODUCT_BUNDLE_IDENTIFIER = net.mdo.OpenSuperWhisperUITests;' "$PROJECT_FILE"
+    assert_not_contains 'PRODUCT_BUNDLE_IDENTIFIER = ru.starmel.OpenSuperWhisper' "$PROJECT_FILE"
+    assert_contains '--identifier net.mdo.OpenSuperWhisper' "$RUN_SCRIPT"
+    assert_not_contains '--identifier ru.starmel.OpenSuperWhisper' "$RUN_SCRIPT"
+    assert_contains 'net.mdo.OpenSuperWhisper.audio-callback' "$CAPTURE_SOURCE"
+    assert_not_contains 'ru.starmel.OpenSuperWhisper.audio-callback' "$CAPTURE_SOURCE"
+    pass "active app, test, UI-test, signing, and dispatch identities are consistent"
+}
+
 make_fake_tools
 test_dry_run
 test_dirty_tree
@@ -433,4 +448,5 @@ test_origin_credentials_are_redacted
 test_manifest_and_publish_guards
 test_secret_and_publish
 test_verify_never_publishes
+test_fork_identity_contract
 printf 'All %d release safety tests passed.\n' "$TESTS_RUN"

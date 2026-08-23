@@ -7,7 +7,7 @@ final class RecordingStoragePathTests: XCTestCase {
         let isolatedRoot = try TestFixture.temporaryDirectory(prefix: "OpenSuperWhisperUITestStorage")
         defer { try? FileManager.default.removeItem(at: isolatedRoot) }
 
-        let bundleIdentifier = "ru.starmel.OpenSuperWhisper"
+        let bundleIdentifier = ForkIdentityMigrator.currentBundleIdentifier
         let environment = [
             "OPEN_SUPER_WHISPER_UI_TEST": "1",
             Recording.uiTestStorageRootEnvironmentKey: isolatedRoot.path
@@ -57,10 +57,10 @@ final class RecordingStoragePathTests: XCTestCase {
             arguments: [],
             environment: environment,
             applicationSupportDirectory: productionSupport,
-            bundleIdentifier: "ru.starmel.OpenSuperWhisper"
+            bundleIdentifier: ForkIdentityMigrator.currentBundleIdentifier
         )
         let expectedProductionDirectory = productionSupport.appendingPathComponent(
-            "ru.starmel.OpenSuperWhisper",
+            ForkIdentityMigrator.currentBundleIdentifier,
             isDirectory: true
         )
         XCTAssertEqual(
@@ -72,7 +72,7 @@ final class RecordingStoragePathTests: XCTestCase {
             arguments: ["--open-super-whisper-ui-test"],
             environment: [Recording.uiTestStorageRootEnvironmentKey: isolatedRoot.path],
             applicationSupportDirectory: productionSupport,
-            bundleIdentifier: "ru.starmel.OpenSuperWhisper"
+            bundleIdentifier: ForkIdentityMigrator.currentBundleIdentifier
         )
         XCTAssertEqual(
             withoutMarker.standardizedFileURL,

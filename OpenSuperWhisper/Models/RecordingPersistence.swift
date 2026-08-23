@@ -337,6 +337,10 @@ struct RecordingReconciliationReport: Equatable, Sendable {
     var temporaryCaptures: [RecordingRecoveryArtifact] {
         recoveredArtifacts.filter { $0.kind == .temporaryCapture }
     }
+
+    var pendingDeletions: [RecordingRecoveryArtifact] {
+        recoveredArtifacts.filter { $0.kind == .pendingDeletion }
+    }
 }
 
 enum RecordingRecoveryDisposition: Sendable {
@@ -496,12 +500,23 @@ struct RecordingAudioRepairResult: Equatable, Sendable {
 protocol RecordingFileSystem: AnyObject {
     func fileExists(at url: URL) -> Bool
     func isDirectory(at url: URL) -> Bool
+    /// Returns the regular-file size in bytes when it can be read.  The
+    /// default implementation keeps existing test doubles source-compatible
+    /// while allowing retention tests to provide deterministic sizes.
+    func fileSize(at url: URL) -> Int64?
     func createDirectory(at url: URL) throws
     func contentsOfDirectory(at url: URL) throws -> [URL]
     func copyItem(at sourceURL: URL, to destinationURL: URL) throws
     func moveItem(at sourceURL: URL, to destinationURL: URL) throws
     func removeItem(at url: URL) throws
     func write(_ data: Data, to url: URL) throws
+}
+
+extension RecordingFileSystem {
+    func fileSize(at url: URL) -> Int64? {
+        guard fileExists(at: url), !isDirectory(at: url) else { return nil }
+        return try? Int64(url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
+    }
 }
 
 final class LocalRecordingFileSystem: RecordingFileSystem, @unchecked Sendable {

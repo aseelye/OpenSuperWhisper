@@ -179,7 +179,7 @@ public struct FileManagerAudioCaptureFileSystem: AudioCaptureFileSystemDriver, S
 public final class DispatchAudioCaptureCallbackExecutor: AudioCaptureCallbackExecutor, @unchecked Sendable {
     private let queue: DispatchQueue
 
-    public init(label: String = "ru.starmel.OpenSuperWhisper.audio-callback") {
+    public init(label: String = "net.mdo.OpenSuperWhisper.audio-callback") {
         self.queue = DispatchQueue(
             label: "\(label).\(UUID().uuidString)",
             qos: .userInitiated
@@ -527,7 +527,7 @@ public final class AudioCaptureSession: DictationAudioCaptureSession, @unchecked
             .appendingPathComponent("recording-\(UUID().uuidString).wav")
         let state = AudioCaptureAdmissionState(generation: generation)
         let writerQueue = DispatchQueue(
-            label: "ru.starmel.OpenSuperWhisper.audio-writer.\(generation).\(UUID().uuidString)",
+            label: "net.mdo.OpenSuperWhisper.audio-writer.\(generation).\(UUID().uuidString)",
             qos: .userInitiated
         )
         let receiver = AudioCaptureTapReceiver(

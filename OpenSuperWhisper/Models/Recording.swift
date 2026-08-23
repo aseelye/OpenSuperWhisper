@@ -65,9 +65,13 @@ struct Recording: Identifiable, Codable, FetchableRecord, PersistableRecord, Equ
         applicationSupportDirectory: URL? = nil,
         bundleIdentifier: String? = nil
     ) -> URL {
+        // The production target's active identity is explicit. Bundle.main
+        // can be nil in previews, unit tests, and early startup, and the
+        // historical fallback would otherwise silently create a third
+        // storage root outside the migration's active domain.
         let resolvedBundleIdentifier = bundleIdentifier
             ?? Bundle.main.bundleIdentifier
-            ?? "OpenSuperWhisper"
+            ?? ForkIdentityMigrator.currentBundleIdentifier
 
         if let storageRoot = uiTestStorageRoot(
             arguments: arguments,
@@ -220,6 +224,10 @@ final class RecordingStore: ObservableObject {
     private let databaseFailureInjector: ((RecordingDatabaseOperation) -> RecordingStoreError?)?
     private var dbQueue: DatabaseQueue?
     private var initializationFailure: RecordingStoreError?
+    /// Serializes retention and destructive history mutations across async
+    /// suspension points.  Main-actor isolation alone is not sufficient:
+    /// another task may run while a database or file operation is awaited.
+    private let mutationGate = RecordingMutationGate()
 
     /// Creates a store at the app's normal database path. All storage roots
     /// and the database factory can be injected for deterministic tests and a
@@ -365,14 +373,30 @@ final class RecordingStore: ObservableObject {
 
     @discardableResult
     func loadRecordings() async -> RecordingLoadResult {
+        await withMutationGate {
+            await self.loadRecordingsUnlocked()
+        }
+    }
+
+    /// The gate-free implementation used by a mutation that already owns the
+    /// store gate.  Keeping this separate prevents a deletion batch from
+    /// deadlocking while it performs its one post-batch reconciliation load.
+    private func loadRecordingsUnlocked(
+        performReconciliation: Bool = true
+    ) async -> RecordingLoadResult {
         guard let dbQueue else {
             let error = initializationFailure
                 ?? .databaseUnavailable("The history database is not open.")
+            let pendingErrors = preservePendingDeletionArtifacts()
             historyStatus = .unavailable(error.localizedDescription)
             return RecordingLoadResult(
                 state: .unavailable,
                 recordings: recordings,
-                error: error
+                error: pendingErrors.isEmpty
+                    ? error
+                    : .recoveryFailed(
+                        "\(error.localizedDescription); \(pendingErrors.joined(separator: "; "))"
+                    )
             )
         }
 
@@ -380,7 +404,29 @@ final class RecordingStore: ObservableObject {
             try checkDatabaseOperation(.read)
             let loadedRecordings = try await Self.fetchAllRecordings(from: dbQueue)
             recordings = loadedRecordings
-            let report = reconcileFiles(for: loadedRecordings)
+            let report: RecordingReconciliationReport
+            if performReconciliation {
+                report = reconcileFiles(for: loadedRecordings)
+            } else {
+                // Retention is deliberately scoped to managed row URLs.  A
+                // post-batch publication must not turn into an orphan/temp
+                // scan that moves unrelated user files into Recovery.
+                let pendingResult = reconcilePendingDeletionArtifacts(for: loadedRecordings)
+                let recoveredArtifacts = pendingResult.artifacts.reduce(
+                    into: recoveryInventory
+                ) { current, artifact in
+                    current = mergeRecoveryArtifact(artifact, into: current)
+                }
+                report = RecordingReconciliationReport(
+                    missingRecordings: loadedRecordings.filter {
+                        !availability(for: $0).isPlayable
+                    },
+                    recoveredArtifacts: recoveredArtifacts,
+                    errors: reconciliationReport.errors + pendingResult.errors
+                )
+                recoveryInventory = report.recoveredArtifacts
+                reconciliationReport = report
+            }
             missingRecordings = report.missingRecordings
             if !report.errors.isEmpty {
                 historyStatus = .staleWithError(report.errors.joined(separator: "; "))
@@ -403,13 +449,22 @@ final class RecordingStore: ObservableObject {
                 error,
                 default: .databaseReadFailed(error.localizedDescription)
             )
+            // A pending deletion is safe to remove only after a successful
+            // authoritative row lookup.  If the lookup itself failed, move
+            // the artifact into Recovery so it remains user-visible and
+            // recoverable rather than guessing that its row is gone.
+            let pendingErrors = preservePendingDeletionArtifacts()
             historyStatus = recordings.isEmpty
                 ? .unavailable(failure.localizedDescription)
                 : .staleWithError(failure.localizedDescription)
             return RecordingLoadResult(
                 state: recordings.isEmpty ? .unavailable : .stale,
                 recordings: recordings,
-                error: failure
+                error: pendingErrors.isEmpty
+                    ? failure
+                    : .recoveryFailed(
+                        "\(failure.localizedDescription); \(pendingErrors.joined(separator: "; "))"
+                    )
             )
         }
     }
@@ -616,7 +671,9 @@ final class RecordingStore: ObservableObject {
     /// failed restore is returned as repair-required rather than hidden.
     @discardableResult
     func deleteRecordingAndAwait(_ recording: Recording) async -> RecordingDeletionResult {
-        await deleteRecordingAndAwait(recording, reloadAfterDeletion: true)
+        await withMutationGate {
+            await self.deleteRecordingAndAwait(recording, reloadAfterDeletion: true)
+        }
     }
 
     private func deleteRecordingAndAwait(
@@ -671,7 +728,11 @@ final class RecordingStore: ObservableObject {
         }
 
         let originalURL = url(for: authoritative)
+        // A managed row URL must point to a regular file.  Treat a directory
+        // at that path like missing audio so retention never recursively
+        // moves/deletes an unrelated directory.
         let hasAudio = fileSystem.fileExists(at: originalURL)
+            && !fileSystem.isDirectory(at: originalURL)
         var quarantineURL: URL?
         var movedToQuarantine = false
 
@@ -737,6 +798,10 @@ final class RecordingStore: ObservableObject {
                     operation: "restore quarantined",
                     url: originalURL
                 )
+                // Keep a failed compensation visible to Recovery immediately
+                // instead of leaving the only copy stranded in the private
+                // quarantine directory until a future startup.
+                _ = await loadRecordingsUnlocked()
                 return RecordingDeletionResult(
                     recordingID: authoritative.id,
                     state: .databaseFailedRepairRequired,
@@ -761,7 +826,7 @@ final class RecordingStore: ObservableObject {
         }
 
         if reloadAfterDeletion {
-            _ = await loadRecordings()
+            _ = await loadRecordingsUnlocked()
         }
         if let cleanupError {
             return RecordingDeletionResult(
@@ -795,6 +860,12 @@ final class RecordingStore: ObservableObject {
 
     @discardableResult
     func deleteAllRecordingsAndAwait() async -> RecordingBulkDeletionResult {
+        await withMutationGate {
+            await self.deleteAllRecordingsAndAwaitUnlocked()
+        }
+    }
+
+    private func deleteAllRecordingsAndAwaitUnlocked() async -> RecordingBulkDeletionResult {
         guard let dbQueue else {
             let error = initializationFailure
                 ?? .databaseUnavailable("The history database is not open.")
@@ -821,7 +892,7 @@ final class RecordingStore: ObservableObject {
                 reloadAfterDeletion: false
             ))
         }
-        _ = await loadRecordings()
+        _ = await loadRecordingsUnlocked()
         return RecordingBulkDeletionResult(results: results)
     }
 
@@ -838,6 +909,142 @@ final class RecordingStore: ObservableObject {
         }
     }
 
+    // MARK: - Retention
+
+    /// Evaluates retention against a fresh authoritative database snapshot.
+    /// The published `recordings` array is intentionally not used for
+    /// eligibility: it may be stale while a background load is in flight.
+    @discardableResult
+    func previewRetention(
+        policy: RecordingRetentionPolicy = .default,
+        now: Date = Date()
+    ) async -> RecordingRetentionPreview {
+        await withMutationGate {
+            await self.previewRetentionUnlocked(policy: policy, now: now)
+        }
+    }
+
+    /// Applies a retention policy as one serialized batch.  Each row uses the
+    /// same quarantine/database compensation path as manual deletion, while
+    /// reconciliation runs only once after the complete batch.
+    @discardableResult
+    func applyRetention(
+        policy: RecordingRetentionPolicy = .default,
+        now: Date = Date()
+    ) async -> RecordingRetentionResult {
+        await withMutationGate {
+            let evaluation = await self.evaluateRetention(policy: policy, now: now)
+            guard evaluation.preview.error == nil else {
+                return RecordingRetentionResult(
+                    preview: evaluation.preview,
+                    deletionResults: [],
+                    error: evaluation.preview.error
+                )
+            }
+
+            var deletionResults: [RecordingDeletionResult] = []
+            deletionResults.reserveCapacity(evaluation.eligible.count)
+            for recording in evaluation.eligible {
+                // The gate is already held by this batch; use the private
+                // implementation so a duplicate sweep cannot interleave.
+                deletionResults.append(await self.deleteRecordingAndAwait(
+                    recording,
+                    reloadAfterDeletion: false
+                ))
+            }
+
+            // Even an empty/forever batch publishes one fresh reconciliation
+            // snapshot, matching Clear All's publication contract.
+            let reload = await self.loadRecordingsUnlocked(performReconciliation: false)
+            let reloadError = reload.error
+            return RecordingRetentionResult(
+                preview: evaluation.preview,
+                deletionResults: deletionResults,
+                error: reloadError
+            )
+        }
+    }
+
+    private func previewRetentionUnlocked(
+        policy: RecordingRetentionPolicy,
+        now: Date
+    ) async -> RecordingRetentionPreview {
+        let evaluation = await evaluateRetention(policy: policy, now: now)
+        return evaluation.preview
+    }
+
+    private func evaluateRetention(
+        policy: RecordingRetentionPolicy,
+        now: Date
+    ) async -> (preview: RecordingRetentionPreview, eligible: [Recording]) {
+        let normalizedPolicy = policy.normalized
+        let cutoff: Date?
+        switch normalizedPolicy {
+        case .forever:
+            cutoff = nil
+        case .days(let days):
+            cutoff = now.addingTimeInterval(-TimeInterval(days) * 86_400)
+        }
+
+        guard let dbQueue else {
+            let error = initializationFailure
+                ?? .databaseUnavailable("The history database is not open.")
+            return (
+                RecordingRetentionPreview(
+                    policy: normalizedPolicy,
+                    cutoff: cutoff,
+                    error: error
+                ),
+                []
+            )
+        }
+
+        do {
+            try checkDatabaseOperation(.read)
+            let rows = try await Self.fetchAllRecordings(from: dbQueue)
+            let eligible: [Recording]
+            switch cutoff {
+            case .none:
+                eligible = []
+            case .some(let cutoff):
+                // Strictly older is intentional: a row exactly on the
+                // boundary remains in history for one more sweep.
+                eligible = rows.filter { $0.timestamp < cutoff }
+            }
+
+            let bytes = eligible.reduce(into: Int64.zero) { total, recording in
+                let managedURL = url(for: recording)
+                guard fileSystem.fileExists(at: managedURL),
+                      !fileSystem.isDirectory(at: managedURL),
+                      let size = fileSystem.fileSize(at: managedURL),
+                      size > 0 else { return }
+                total += size
+            }
+            return (
+                RecordingRetentionPreview(
+                    policy: normalizedPolicy,
+                    cutoff: cutoff,
+                    eligibleEntryCount: eligible.count,
+                    totalManagedAudioBytes: bytes
+                ),
+                eligible
+            )
+        } catch {
+            let failure = Self.storeError(
+                error,
+                default: .databaseReadFailed(error.localizedDescription)
+            )
+            return (
+                RecordingRetentionPreview(
+                    policy: normalizedPolicy,
+                    cutoff: cutoff,
+                    error: failure
+                ),
+                []
+            )
+        }
+    }
+
     // MARK: - Reconciliation and recovery
 
     /// Reconciles rows and app-owned audio paths without deleting unknown
@@ -845,13 +1052,20 @@ final class RecordingStore: ObservableObject {
     /// repeated calls idempotent and allowing the UI to surface repair work.
     @discardableResult
     func reconcile() async -> RecordingReconciliationReport {
+        await withMutationGate {
+            await self.reconcileUnlocked()
+        }
+    }
+
+    private func reconcileUnlocked() async -> RecordingReconciliationReport {
         guard let dbQueue else {
             let error = initializationFailure
                 ?? .databaseUnavailable("The history database is not open.")
+            let pendingErrors = preservePendingDeletionArtifacts()
             let report = RecordingReconciliationReport(
                 missingRecordings: recordings,
                 recoveredArtifacts: recoveryInventory,
-                errors: [error.localizedDescription]
+                errors: [error.localizedDescription] + pendingErrors
             )
             missingRecordings = recordings
             reconciliationReport = report
@@ -873,13 +1087,14 @@ final class RecordingStore: ObservableObject {
                 error,
                 default: .databaseReadFailed(error.localizedDescription)
             )
+            let pendingErrors = preservePendingDeletionArtifacts()
             historyStatus = recordings.isEmpty
                 ? .unavailable(failure.localizedDescription)
                 : .staleWithError(failure.localizedDescription)
             return RecordingReconciliationReport(
                 missingRecordings: recordings,
                 recoveredArtifacts: recoveryInventory,
-                errors: [failure.localizedDescription]
+                errors: [failure.localizedDescription] + pendingErrors
             )
         }
     }
@@ -1401,15 +1616,11 @@ final class RecordingStore: ObservableObject {
             }
         }
 
-        for candidate in scan(quarantineDirectory) {
-            guard !fileSystem.isDirectory(at: candidate),
-                  isGeneratedRecoveryFile(candidate, prefix: "pending") else { continue }
-            if let artifact = moveToRecovery(candidate, kind: .pendingDeletion, prefix: "pending") {
-                appendRecovered(artifact)
-            } else {
-                errors.append("Could not preserve pending deletion at \(candidate.path).")
-            }
+        let pendingResult = reconcilePendingDeletionArtifacts(for: rows)
+        for artifact in pendingResult.artifacts {
+            appendRecovered(artifact)
         }
+        errors.append(contentsOf: pendingResult.errors)
 
         // Recovery is intentionally not cleaned up by startup. Existing
         // artifacts are part of the repair inventory even after a restart.
@@ -1432,6 +1643,85 @@ final class RecordingStore: ObservableObject {
         recoveryInventory = recovered
         reconciliationReport = report
         return report
+    }
+
+    private func reconcilePendingDeletionArtifacts(
+        for rows: [Recording]
+    ) -> (artifacts: [RecordingRecoveryArtifact], errors: [String]) {
+        guard fileSystem.fileExists(at: quarantineDirectory) else {
+            return ([], [])
+        }
+
+        let candidates: [URL]
+        do {
+            candidates = try fileSystem.contentsOfDirectory(at: quarantineDirectory)
+        } catch {
+            return ([], ["\(quarantineDirectory.path): \(error.localizedDescription)"])
+        }
+
+        var artifacts: [RecordingRecoveryArtifact] = []
+        var errors: [String] = []
+        for candidate in candidates {
+            guard !fileSystem.isDirectory(at: candidate),
+                  isGeneratedRecoveryFile(candidate, prefix: "pending") else { continue }
+
+            // A pending artifact is the intentional deletion hand-off.  It
+            // may be discarded without user-visible Recovery inventory only
+            // after the successful DB snapshot above confirms its row is
+            // absent.  Existing rows and malformed IDs are preserved.
+            if let recordingID = pendingRecordingID(for: candidate),
+               !rows.contains(where: { $0.id == recordingID }) {
+                do {
+                    try fileSystem.removeItem(at: candidate)
+                    continue
+                } catch {
+                    // If cleanup itself fails, preserve the bytes through the
+                    // existing Recovery path rather than dropping them.
+                }
+            }
+
+            if let artifact = moveToRecovery(
+                candidate,
+                kind: .pendingDeletion,
+                prefix: "pending"
+            ) {
+                artifacts.append(artifact)
+            } else {
+                errors.append("Could not preserve pending deletion at \(candidate.path).")
+            }
+        }
+        return (artifacts, errors)
+    }
+
+    /// Preserves pending deletion artifacts when no authoritative DB snapshot
+    /// could be obtained.  This deliberately never guesses that a row is
+    /// absent; the artifact remains in the existing Recovery inventory.
+    @discardableResult
+    private func preservePendingDeletionArtifacts() -> [String] {
+        guard fileSystem.fileExists(at: quarantineDirectory) else { return [] }
+
+        let candidates: [URL]
+        do {
+            candidates = try fileSystem.contentsOfDirectory(at: quarantineDirectory)
+        } catch {
+            return ["\(quarantineDirectory.path): \(error.localizedDescription)"]
+        }
+
+        var errors: [String] = []
+        for candidate in candidates {
+            guard !fileSystem.isDirectory(at: candidate),
+                  isGeneratedRecoveryFile(candidate, prefix: "pending") else { continue }
+            if let artifact = moveToRecovery(
+                candidate,
+                kind: .pendingDeletion,
+                prefix: "pending"
+            ) {
+                appendRecoveryArtifact(artifact)
+            } else {
+                errors.append("Could not preserve pending deletion at \(candidate.path).")
+            }
+        }
+        return errors
     }
 
     private func moveToRecovery(
@@ -1503,6 +1793,14 @@ final class RecordingStore: ObservableObject {
         return quarantineDirectory.appendingPathComponent(
             "pending-\(recording.id.uuidString)-\(basename)"
         )
+    }
+
+    private func pendingRecordingID(for url: URL) -> UUID? {
+        let stem = url.deletingPathExtension().lastPathComponent
+        let prefix = "pending-"
+        guard stem.hasPrefix(prefix) else { return nil }
+        let identifier = String(stem.dropFirst(prefix.count).prefix(36))
+        return UUID(uuidString: identifier)
     }
 
     private func isAudioFile(_ url: URL) -> Bool {
@@ -1623,5 +1921,12 @@ final class RecordingStore: ObservableObject {
         if let failure = databaseFailureInjector?(operation) {
             throw failure
         }
+    }
+
+    private func withMutationGate<T>(_ operation: () async -> T) async -> T {
+        await mutationGate.acquire()
+        let result = await operation()
+        await mutationGate.release()
+        return result
     }
 }
