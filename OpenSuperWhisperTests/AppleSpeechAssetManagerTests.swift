@@ -59,6 +59,47 @@ final class AppleSpeechAssetManagerTests: XCTestCase {
         )
     }
 
+    func testAlreadyReservedLocaleSucceedsWhenReserveReportsNoChange() async throws {
+        let locale = Locale(identifier: "en-US")
+        let manager = makeManager(testHooks: .init(
+            supportedLocales: { [locale] },
+            installedLocales: { [locale] },
+            supportedLocale: { _ in locale },
+            status: { _ in .installed },
+            install: { _ in },
+            reserve: { _ in false },
+            reservedLocales: { [locale] }
+        ))
+
+        let prepared = try await manager.prepare(locale: locale)
+
+        XCTAssertEqual(prepared.identifier, locale.identifier)
+        XCTAssertEqual(manager.currentStatus?.state, .installed)
+    }
+
+    func testUnreservedLocaleStillFailsWhenReserveReportsFalse() async {
+        let locale = Locale(identifier: "en-US")
+        let manager = makeManager(testHooks: .init(
+            supportedLocales: { [locale] },
+            installedLocales: { [locale] },
+            supportedLocale: { _ in locale },
+            status: { _ in .installed },
+            install: { _ in },
+            reserve: { _ in false }
+        ))
+
+        do {
+            _ = try await manager.prepare(locale: locale)
+            XCTFail("An absent reservation must not be reported as ready.")
+        } catch let error as CoreTranscriptionError {
+            guard case .preparationFailed = error else {
+                return XCTFail("Expected preparationFailed, received \(error).")
+            }
+        } catch {
+            XCTFail("Expected CoreTranscriptionError, received \(error).")
+        }
+    }
+
     func testCanceledWaiterDoesNotCancelSharedPreparation() async throws {
         let locale = Locale(identifier: "en-US")
         let inventory = TestInventory(locales: [locale], gatedLocale: locale)

@@ -101,6 +101,114 @@ final class ProviderBoundaryDeterministicTests: XCTestCase {
         XCTAssertEqual(factory.driver?.cancelCount, 0)
     }
 
+    func testAppleTerminalDriverErrorIsNotMaskedAsNotStarted() async throws {
+        let factory = FailingAppendAppleDriverFactory()
+        let engine = AppleSpeechTranscriptionEngine(liveSessionFactory: factory)
+        let operation = try XCTUnwrap(
+            try engine.makeLiveOperation(
+                locale: Locale(identifier: "en-US"),
+                context: nil,
+                expectedTerms: []
+            ) as? AppleSpeechLiveTranscriptionOperation
+        )
+        try await operation.start()
+        let driver = try XCTUnwrap(factory.driver)
+        let buffer = try makeBuffer(seconds: 0.1)
+
+        // Admission succeeds, then the consumer observes the driver's
+        // asynchronous analyzer failure and releases the live driver.
+        try await operation.append(buffer: buffer)
+        let cancellationObserved = await driver.cancelRequested.wait(timeout: 5)
+        XCTAssertTrue(cancellationObserved)
+
+        do {
+            try await operation.append(buffer: buffer)
+            XCTFail("Expected the original terminal analyzer error")
+        } catch let error as CoreTranscriptionError {
+            XCTAssertEqual(error, .analyzerFailed("synthetic input failure"))
+        }
+        await operation.cancelAndWait()
+    }
+
+    func testAppleCancellationAwaitsInFlightFinalizationAndWinsBeforeCommit() async throws {
+        let factory = BlockingAppleDriverFactory()
+        let engine = AppleSpeechTranscriptionEngine(liveSessionFactory: factory)
+        let operation = try XCTUnwrap(
+            try engine.makeLiveOperation(
+                locale: Locale(identifier: "en-US"),
+                context: nil,
+                expectedTerms: []
+            ) as? AppleSpeechLiveTranscriptionOperation
+        )
+        try await operation.start()
+        let driver = try XCTUnwrap(factory.driver)
+
+        let finishTask = Task { () -> CoreTranscriptionError? in
+            do {
+                _ = try await operation.finish()
+                return nil
+            } catch let error as CoreTranscriptionError {
+                return error
+            } catch {
+                return .analyzerFailed(error.localizedDescription)
+            }
+        }
+        let finishStarted = await driver.finishStarted.wait(timeout: 5)
+        XCTAssertTrue(finishStarted)
+        defer { driver.releaseFinish() }
+
+        let cancellationCompleted = TestEventRecorder()
+        let cancellationTask = Task {
+            await operation.cancelAndWait()
+            cancellationCompleted.record()
+        }
+
+        // The driver deliberately returns from cancelAndWait without
+        // releasing finish(). The operation must still await its shared
+        // finalization task before reporting quiescence.
+        let completedBeforeFinishReleased = await cancellationCompleted.wait(timeout: 0.1)
+        XCTAssertFalse(completedBeforeFinishReleased)
+
+        driver.releaseFinish()
+        let finishError = await finishTask.value
+        XCTAssertEqual(finishError, .cancelled)
+        await cancellationTask.value
+
+        let cancelRequested = await driver.cancelRequested.wait(timeout: 5)
+        XCTAssertTrue(cancelRequested)
+        XCTAssertEqual(driver.finishCount, 1)
+        XCTAssertEqual(driver.cancelCount, 1)
+    }
+
+    func testAppleConcurrentFinishCallersShareFinalizationTask() async throws {
+        let factory = BlockingAppleDriverFactory()
+        let engine = AppleSpeechTranscriptionEngine(liveSessionFactory: factory)
+        let operation = try XCTUnwrap(
+            try engine.makeLiveOperation(
+                locale: Locale(identifier: "en-US"),
+                context: nil,
+                expectedTerms: []
+            ) as? AppleSpeechLiveTranscriptionOperation
+        )
+        try await operation.start()
+        let driver = try XCTUnwrap(factory.driver)
+
+        let firstFinish = Task { try await operation.finish() }
+        let finishStarted = await driver.finishStarted.wait(timeout: 5)
+        XCTAssertTrue(finishStarted)
+        let secondFinish = Task { try await operation.finish() }
+
+        driver.releaseFinish()
+        let firstTranscript = try await firstFinish.value
+        let secondTranscript = try await secondFinish.value
+
+        XCTAssertEqual(firstTranscript, secondTranscript)
+        XCTAssertEqual(firstTranscript.text, "blocking transcript")
+        XCTAssertEqual(driver.finishCount, 1)
+        await operation.cancelAndWait()
+        XCTAssertEqual(driver.cancelCount, 0)
+    }
+
     func testOpenAIFileOperationEmitsRetryAndUploadProgressAndHonorsSanitization() async throws {
         let fileURL = try TestFixture.temporaryFile(contents: Data("audio".utf8), fileExtension: "wav")
         defer { try? FileManager.default.removeItem(at: fileURL) }
@@ -352,6 +460,111 @@ private final class DeterministicAppleDriver: AppleSpeechLiveSessionDriver, @unc
 
     func cancelAndWait() async {
         cancelCount += 1
+    }
+}
+
+private final class BlockingAppleDriverFactory: AppleSpeechLiveSessionDriverFactory, @unchecked Sendable {
+    private(set) var driver: BlockingAppleDriver?
+
+    func makeLiveSession(
+        locale: Locale,
+        context: String?,
+        expectedTerms: [String],
+        analyzerPriority: TaskPriority
+    ) async throws -> any AppleSpeechLiveSessionDriver {
+        _ = (locale, context, expectedTerms, analyzerPriority)
+        let driver = BlockingAppleDriver()
+        self.driver = driver
+        return driver
+    }
+}
+
+private final class FailingAppendAppleDriverFactory: AppleSpeechLiveSessionDriverFactory, @unchecked Sendable {
+    private(set) var driver: FailingAppendAppleDriver?
+
+    func makeLiveSession(
+        locale: Locale,
+        context: String?,
+        expectedTerms: [String],
+        analyzerPriority: TaskPriority
+    ) async throws -> any AppleSpeechLiveSessionDriver {
+        _ = (locale, context, expectedTerms, analyzerPriority)
+        let driver = FailingAppendAppleDriver()
+        self.driver = driver
+        return driver
+    }
+}
+
+private final class FailingAppendAppleDriver: AppleSpeechLiveSessionDriver, @unchecked Sendable {
+    let updates = AsyncStream<TranscriptUpdate> { _ in }
+    let cancelRequested = TestEventRecorder()
+
+    func start() async throws {}
+
+    func append(buffer: AVAudioPCMBuffer) async throws {
+        _ = buffer
+        throw CoreTranscriptionError.analyzerFailed("synthetic input failure")
+    }
+
+    func finish() async throws -> Transcript {
+        XCTFail("A terminal driver must not be finalized")
+        throw CoreTranscriptionError.analyzerFailed("synthetic input failure")
+    }
+
+    func cancelAndWait() async {
+        cancelRequested.record()
+    }
+}
+
+private final class BlockingAppleDriver: AppleSpeechLiveSessionDriver, @unchecked Sendable {
+    let updates: AsyncStream<TranscriptUpdate> = AsyncStream { continuation in
+        continuation.finish()
+    }
+    let finishStarted = TestEventRecorder()
+    let cancelRequested = TestEventRecorder()
+
+    private let lock = NSLock()
+    private var _finishCount = 0
+    private var _cancelCount = 0
+    private var finishReleased = false
+    private var finishWaiters: [CheckedContinuation<Void, Never>] = []
+
+    var finishCount: Int { lock.withLock { _finishCount } }
+    var cancelCount: Int { lock.withLock { _cancelCount } }
+
+    func start() async throws {}
+
+    func append(buffer: AVAudioPCMBuffer) async throws {
+        _ = buffer
+    }
+
+    func finish() async throws -> Transcript {
+        lock.withLock { _finishCount += 1 }
+        finishStarted.record()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeImmediately = lock.withLock {
+                if finishReleased { return true }
+                finishWaiters.append(continuation)
+                return false
+            }
+            if resumeImmediately { continuation.resume() }
+        }
+        return Transcript(text: "blocking transcript")
+    }
+
+    func cancelAndWait() async {
+        lock.withLock { _cancelCount += 1 }
+        cancelRequested.record()
+    }
+
+    func releaseFinish() {
+        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            finishReleased = true
+            let waiters = finishWaiters
+            finishWaiters.removeAll(keepingCapacity: false)
+            return waiters
+        }
+        for waiter in waiters { waiter.resume() }
     }
 }
 

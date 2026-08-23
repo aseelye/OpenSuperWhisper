@@ -175,15 +175,17 @@ struct IndicatorWindow: View {
                 HStack(spacing: 8) {
                     RecordingIndicator(isBlinking: viewModel.isBlinking)
                         .frame(width: 24)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(viewModel.interimText.isEmpty ? "Recording…" : viewModel.interimText)
-                            .font(.system(size: 13, weight: .semibold))
-                            .lineLimit(3)
-                        if let duration = presentation.durationText {
-                            Text(duration)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
+                    Text(viewModel.interimText.isEmpty ? "Recording…" : viewModel.interimText)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                    if let duration = presentation.durationText {
+                        Text(duration)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

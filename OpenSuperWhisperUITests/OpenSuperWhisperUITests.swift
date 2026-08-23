@@ -64,6 +64,7 @@ final class OpenSuperWhisperUITests: XCTestCase {
             "OPEN_SUPER_WHISPER_UI_TEST": "1",
             "OPEN_SUPER_WHISPER_UI_TEST_ID": UUID().uuidString,
             "OPEN_SUPER_WHISPER_UI_TEST_STORAGE_ROOT": root.path,
+            "CFFIXED_USER_HOME": root.path,
             "HOME": root.path
         ]
         app.launch()

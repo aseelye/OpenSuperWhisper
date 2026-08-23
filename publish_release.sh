@@ -122,7 +122,11 @@ remote_repo_parts() {
             ;;
         ssh://*/*|https://*/*|http://*/*)
             origin_rest=${origin_url#*://}
-            ORIGIN_HOST=${origin_rest%%/*}
+            origin_authority=${origin_rest%%/*}
+            # Drop URL user-info before any host/repository value is logged
+            # or passed to gh. scp-style git@host:path is handled separately
+            # above and already removes its transport user.
+            ORIGIN_HOST=${origin_authority##*@}
             ORIGIN_PATH=${origin_rest#*/}
             ;;
         *)

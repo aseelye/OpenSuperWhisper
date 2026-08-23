@@ -131,6 +131,7 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         let status: @MainActor (Locale) async -> AppleSpeechAssetState
         let install: @MainActor (Locale) async throws -> Void
         let reserve: @MainActor (Locale) async -> Bool
+        let reservedLocales: @MainActor () async -> [Locale]
         let release: @MainActor (Locale) async -> Bool
         let waiterRegistered: (@MainActor () -> Void)?
         let progressSource: TestProgressSource?
@@ -142,6 +143,7 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
             status: @escaping @MainActor (Locale) async -> AppleSpeechAssetState,
             install: @escaping @MainActor (Locale) async throws -> Void,
             reserve: @escaping @MainActor (Locale) async -> Bool,
+            reservedLocales: @escaping @MainActor () async -> [Locale] = { [] },
             release: @escaping @MainActor (Locale) async -> Bool = { _ in true },
             waiterRegistered: (@MainActor () -> Void)? = nil,
             progressSource: TestProgressSource? = nil
@@ -152,6 +154,7 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
             self.status = status
             self.install = install
             self.reserve = reserve
+            self.reservedLocales = reservedLocales
             self.release = release
             self.waiterRegistered = waiterRegistered
             self.progressSource = progressSource
@@ -622,7 +625,18 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
         let alreadyRetained = retainedReservations[key] != nil
         if !alreadyRetained {
             let reserved = try await reserve(locale: locale)
-            guard reserved else {
+            // Installation requests reserve their locales automatically. A
+            // subsequent explicit reserve may therefore report that it made
+            // no change even though this app already owns the reservation.
+            // Verify the inventory before treating that result as a failure.
+            let inventoryAlreadyContainsLocale = if reserved {
+                true
+            } else {
+                await reservedLocalesFromInventory().contains {
+                    localeKeysEqual($0, locale)
+                }
+            }
+            guard inventoryAlreadyContainsLocale else {
                 throw CoreTranscriptionError.preparationFailed(
                     "Apple Speech could not reserve \(locale.identifier)."
                 )
@@ -730,6 +744,13 @@ public final class AppleSpeechAssetManager: ObservableObject, AppleSpeechAssetMa
             return await testHooks.reserve(locale)
         }
         return try await AssetInventory.reserve(locale: locale)
+    }
+
+    private func reservedLocalesFromInventory() async -> [Locale] {
+        if let testHooks {
+            return await testHooks.reservedLocales()
+        }
+        return await AssetInventory.reservedLocales
     }
 
     private func releaseReservedAsset(locale: Locale) async -> Bool {

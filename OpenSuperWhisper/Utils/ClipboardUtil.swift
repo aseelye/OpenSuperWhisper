@@ -1,6 +1,16 @@
 import Cocoa
 
 class ClipboardUtil {
+    /// Replaces the general pasteboard with text without sending any input
+    /// events. This is intentionally separate from `insertTextUsingPasteboard`:
+    /// callers that only need a clipboard fallback must never paste into the
+    /// currently focused application.
+    static func copyTextToPasteboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
     private static func saveCurrentPasteboardContents() -> ([NSPasteboard.PasteboardType: Any], [NSPasteboard.PasteboardType])? {
         let pasteboard = NSPasteboard.general
         let types = pasteboard.types ?? []
@@ -97,4 +107,4 @@ class ClipboardUtil {
             restorePasteboardContents(contents)
         }
     }
-} 
+}

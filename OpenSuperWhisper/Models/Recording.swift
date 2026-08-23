@@ -616,6 +616,13 @@ final class RecordingStore: ObservableObject {
     /// failed restore is returned as repair-required rather than hidden.
     @discardableResult
     func deleteRecordingAndAwait(_ recording: Recording) async -> RecordingDeletionResult {
+        await deleteRecordingAndAwait(recording, reloadAfterDeletion: true)
+    }
+
+    private func deleteRecordingAndAwait(
+        _ recording: Recording,
+        reloadAfterDeletion: Bool
+    ) async -> RecordingDeletionResult {
         guard let dbQueue else {
             let error = initializationFailure
                 ?? .databaseUnavailable("The history database is not open.")
@@ -753,7 +760,9 @@ final class RecordingStore: ObservableObject {
             }
         }
 
-        _ = await loadRecordings()
+        if reloadAfterDeletion {
+            _ = await loadRecordings()
+        }
         if let cleanupError {
             return RecordingDeletionResult(
                 recordingID: authoritative.id,
@@ -807,7 +816,10 @@ final class RecordingStore: ObservableObject {
 
         var results: [RecordingDeletionResult] = []
         for recording in authoritative {
-            results.append(await deleteRecordingAndAwait(recording))
+            results.append(await deleteRecordingAndAwait(
+                recording,
+                reloadAfterDeletion: false
+            ))
         }
         _ = await loadRecordings()
         return RecordingBulkDeletionResult(results: results)
@@ -962,6 +974,7 @@ final class RecordingStore: ObservableObject {
             originalURL: request.sourceURL,
             recoveryURL: audioDestination,
             transcriptURL: transcriptURL,
+            metadataURL: metadataDestination,
             recordingID: request.recording.id
         ))
         return RecordingRecoveryResult(receipt: receipt)
@@ -1000,12 +1013,351 @@ final class RecordingStore: ObservableObject {
             : .missing(destination)
     }
 
+    /// Copies a user-selected replacement into the authoritative managed path
+    /// for a row whose audio is missing. The source is never moved or removed;
+    /// the copy first lands at a hidden non-audio temporary path and is then
+    /// renamed into place so reconciliation cannot observe a partial audio
+    /// file. Existing managed audio is never overwritten.
+    @discardableResult
+    func restoreMissingAudio(
+        for recording: Recording,
+        from sourceURL: URL
+    ) async -> RecordingAudioRepairResult {
+        let fallbackDestination = url(for: recording)
+        guard let dbQueue else {
+            let error = initializationFailure
+                ?? .databaseUnavailable("The history database is not open.")
+            return RecordingAudioRepairResult(
+                recordingID: recording.id,
+                state: .failed,
+                sourceURL: sourceURL,
+                destinationURL: fallbackDestination,
+                error: error
+            )
+        }
+
+        let authoritative: Recording?
+        do {
+            try checkDatabaseOperation(.read)
+            authoritative = try await dbQueue.read { db in
+                try Recording
+                    .filter(Recording.Columns.id == recording.id)
+                    .fetchOne(db)
+            }
+        } catch {
+            let failure = Self.storeError(
+                error,
+                default: .databaseReadFailed(error.localizedDescription)
+            )
+            return RecordingAudioRepairResult(
+                recordingID: recording.id,
+                state: .failed,
+                sourceURL: sourceURL,
+                destinationURL: fallbackDestination,
+                error: failure
+            )
+        }
+
+        guard let authoritative else {
+            return RecordingAudioRepairResult(
+                recordingID: recording.id,
+                state: .failed,
+                sourceURL: sourceURL,
+                destinationURL: fallbackDestination,
+                error: .missingRecording(recording.id)
+            )
+        }
+
+        let destinationURL = url(for: authoritative)
+        if fileSystem.fileExists(at: destinationURL) {
+            guard !fileSystem.isDirectory(at: destinationURL) else {
+                return RecordingAudioRepairResult(
+                    recordingID: authoritative.id,
+                    state: .failed,
+                    sourceURL: sourceURL,
+                    destinationURL: destinationURL,
+                    error: .fileOperationFailed(
+                        operation: "validate recording destination",
+                        path: destinationURL.path,
+                        message: "The managed recording destination is a directory."
+                    )
+                )
+            }
+            _ = await loadRecordings()
+            return RecordingAudioRepairResult(
+                recordingID: authoritative.id,
+                state: .alreadyPresent,
+                sourceURL: sourceURL,
+                destinationURL: destinationURL
+            )
+        }
+
+        guard fileSystem.fileExists(at: sourceURL),
+              !fileSystem.isDirectory(at: sourceURL) else {
+            return RecordingAudioRepairResult(
+                recordingID: authoritative.id,
+                state: .failed,
+                sourceURL: sourceURL,
+                destinationURL: destinationURL,
+                error: .fileOperationFailed(
+                    operation: "validate replacement audio",
+                    path: sourceURL.path,
+                    message: "The selected audio file does not exist or is a directory."
+                )
+            )
+        }
+
+        guard isAudioFile(sourceURL) else {
+            return RecordingAudioRepairResult(
+                recordingID: authoritative.id,
+                state: .failed,
+                sourceURL: sourceURL,
+                destinationURL: destinationURL,
+                error: .fileOperationFailed(
+                    operation: "validate replacement audio",
+                    path: sourceURL.path,
+                    message: "The selected file is not a supported audio file."
+                )
+            )
+        }
+
+        guard sourceURL.pathExtension.lowercased()
+                == destinationURL.pathExtension.lowercased() else {
+            return RecordingAudioRepairResult(
+                recordingID: authoritative.id,
+                state: .failed,
+                sourceURL: sourceURL,
+                destinationURL: destinationURL,
+                error: .fileOperationFailed(
+                    operation: "validate replacement audio",
+                    path: sourceURL.path,
+                    message: "The replacement must use the same audio extension as the missing recording."
+                )
+            )
+        }
+
+        let temporaryURL = recordingsDirectory.appendingPathComponent(
+            ".repair-\(UUID().uuidString).partial",
+            isDirectory: false
+        )
+        var temporaryTransferExists = false
+        defer {
+            if temporaryTransferExists {
+                try? fileSystem.removeItem(at: temporaryURL)
+            }
+        }
+
+        do {
+            try fileSystem.createDirectory(at: recordingsDirectory)
+            try fileSystem.copyItem(at: sourceURL, to: temporaryURL)
+            temporaryTransferExists = true
+
+            // Recheck immediately before the final rename. This protects the
+            // no-overwrite contract if another process restores the row while
+            // the user-selected source is being copied.
+            guard !fileSystem.fileExists(at: destinationURL) else {
+                throw NSError(
+                    domain: "RecordingStore",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The managed recording destination already exists."
+                    ]
+                )
+            }
+            try fileSystem.moveItem(at: temporaryURL, to: destinationURL)
+            temporaryTransferExists = false
+        } catch {
+            let failure = Self.fileError(
+                error,
+                operation: "restore replacement audio",
+                url: destinationURL
+            )
+            return RecordingAudioRepairResult(
+                recordingID: authoritative.id,
+                state: .failed,
+                sourceURL: sourceURL,
+                destinationURL: destinationURL,
+                error: failure
+            )
+        }
+
+        _ = await loadRecordings()
+        return RecordingAudioRepairResult(
+            recordingID: authoritative.id,
+            state: .restored,
+            sourceURL: sourceURL,
+            destinationURL: destinationURL
+        )
+    }
+
+    /// Deletes one explicitly reviewed Recovery artifact and its sidecars.
+    /// Only direct children of this store's Recovery directory are eligible;
+    /// an invalid artifact is rejected before any file is removed.
+    @discardableResult
+    func deleteRecoveryArtifactAndAwait(
+        _ artifact: RecordingRecoveryArtifact
+    ) async -> RecordingRecoveryDeletionResult {
+        await deleteRecoveryArtifactAndAwait(artifact, updateInventory: true)
+    }
+
+    /// Deletes the currently published Recovery inventory after one explicit
+    /// user confirmation. Successful items are removed from the inventory in
+    /// one update so a large recovery set does not trigger quadratic SwiftUI
+    /// publication and path-comparison work.
+    @discardableResult
+    func deleteAllRecoveryArtifactsAndAwait() async -> [RecordingRecoveryDeletionResult] {
+        let artifacts = recoveryInventory
+        var results: [RecordingRecoveryDeletionResult] = []
+        var removedArtifactIDs: Set<UUID> = []
+
+        for artifact in artifacts {
+            let result = await deleteRecoveryArtifactAndAwait(
+                artifact,
+                updateInventory: false
+            )
+            results.append(result)
+            if result.succeeded {
+                removedArtifactIDs.insert(artifact.id)
+            }
+        }
+
+        if !removedArtifactIDs.isEmpty {
+            recoveryInventory.removeAll { removedArtifactIDs.contains($0.id) }
+            publishRecoveryInventory()
+        }
+        return results
+    }
+
+    private func deleteRecoveryArtifactAndAwait(
+        _ artifact: RecordingRecoveryArtifact,
+        updateInventory: Bool
+    ) async -> RecordingRecoveryDeletionResult {
+        guard recoveryInventory.contains(where: {
+            $0.id == artifact.id
+                || samePath($0.recoveryURL, artifact.recoveryURL)
+        }) else {
+            return RecordingRecoveryDeletionResult(
+                artifactID: artifact.id,
+                state: .failed,
+                error: .fileOperationFailed(
+                    operation: "validate Recovery artifact",
+                    path: artifact.recoveryURL?.path ?? recoveryDirectory.path,
+                    message: "The Recovery artifact is not in the app's repair inventory."
+                )
+            )
+        }
+
+        let targets = recoveryArtifactFileURLs(for: artifact)
+        guard !targets.isEmpty else {
+            if updateInventory {
+                removeRecoveryArtifactFromInventory(artifact)
+            }
+            return RecordingRecoveryDeletionResult(
+                artifactID: artifact.id,
+                state: .alreadyAbsent
+            )
+        }
+
+        guard targets.allSatisfy({ isDirectChild($0, of: recoveryDirectory) }) else {
+            return RecordingRecoveryDeletionResult(
+                artifactID: artifact.id,
+                state: .failed,
+                error: .fileOperationFailed(
+                    operation: "validate Recovery artifact",
+                    path: recoveryDirectory.path,
+                    message: "Recovery artifacts must be direct children of the app Recovery directory."
+                )
+            )
+        }
+
+        let existingTargets = targets.filter { fileSystem.fileExists(at: $0) }
+        guard !existingTargets.isEmpty else {
+            if updateInventory {
+                removeRecoveryArtifactFromInventory(artifact)
+            }
+            return RecordingRecoveryDeletionResult(
+                artifactID: artifact.id,
+                state: .alreadyAbsent
+            )
+        }
+
+        if let directory = existingTargets.first(where: { fileSystem.isDirectory(at: $0) }) {
+            return RecordingRecoveryDeletionResult(
+                artifactID: artifact.id,
+                state: .failed,
+                error: .fileOperationFailed(
+                    operation: "remove Recovery artifact",
+                    path: directory.path,
+                    message: "Recovery artifact targets must be files, not directories."
+                )
+            )
+        }
+
+        // Sidecars are removed first so a failed audio removal leaves the
+        // primary audio artifact available for another repair attempt.
+        let audioURL = artifact.recoveryURL?.standardizedFileURL
+        let orderedTargets = existingTargets.sorted { lhs, rhs in
+            let lhsIsAudio = audioURL.map { lhs.standardizedFileURL == $0 } ?? false
+            let rhsIsAudio = audioURL.map { rhs.standardizedFileURL == $0 } ?? false
+            return lhsIsAudio && !rhsIsAudio ? false : (!lhsIsAudio && rhsIsAudio)
+        }
+        var removedURLs: [URL] = []
+        for target in orderedTargets {
+            do {
+                try fileSystem.removeItem(at: target)
+                removedURLs.append(target)
+            } catch {
+                return RecordingRecoveryDeletionResult(
+                    artifactID: artifact.id,
+                    state: .failed,
+                    removedURLs: removedURLs,
+                    error: Self.fileError(
+                        error,
+                        operation: "remove Recovery artifact",
+                        url: target
+                    )
+                )
+            }
+        }
+
+        if updateInventory {
+            removeRecoveryArtifactFromInventory(artifact)
+        }
+        return RecordingRecoveryDeletionResult(
+            artifactID: artifact.id,
+            state: .deleted,
+            removedURLs: removedURLs
+        )
+    }
+
     // MARK: - File reconciliation helpers
 
     private func reconcileFiles(for rows: [Recording]) -> RecordingReconciliationReport {
         var errors: [String] = []
         let knownNames = Set(rows.map(\.fileName))
         var recovered = recoveryInventory
+
+        func recoveryPathKey(_ url: URL?) -> String? {
+            url?.standardizedFileURL.path
+        }
+
+        var recoveredPaths = Set(recovered.flatMap { artifact in
+            [
+                recoveryPathKey(artifact.originalURL),
+                recoveryPathKey(artifact.recoveryURL)
+            ].compactMap { $0 }
+        })
+
+        func appendRecovered(_ artifact: RecordingRecoveryArtifact) {
+            let paths = Set([
+                recoveryPathKey(artifact.originalURL),
+                recoveryPathKey(artifact.recoveryURL)
+            ].compactMap { $0 })
+            guard recoveredPaths.isDisjoint(with: paths) else { return }
+            recovered.append(artifact)
+            recoveredPaths.formUnion(paths)
+        }
 
         func scan(_ directory: URL) -> [URL] {
             do {
@@ -1022,28 +1374,38 @@ final class RecordingStore: ObservableObject {
         let preexistingRecoveryFiles = scan(recoveryDirectory)
 
         for candidate in scan(recordingsDirectory) {
-            guard !fileSystem.isDirectory(at: candidate), isAudioFile(candidate) else { continue }
+            guard !fileSystem.isDirectory(at: candidate),
+                  isAppGeneratedRecordingFile(candidate) else { continue }
             guard !knownNames.contains(candidate.lastPathComponent) else { continue }
             if let artifact = moveToRecovery(candidate, kind: .orphanAudio, prefix: "orphan") {
-                recovered = mergeRecoveryArtifact(artifact, into: recovered)
+                appendRecovered(artifact)
             } else {
                 errors.append("Could not quarantine orphan audio at \(candidate.path).")
             }
         }
 
         for candidate in scan(temporaryCaptureDirectory) {
-            guard !fileSystem.isDirectory(at: candidate), isTemporaryCapture(candidate) else { continue }
+            guard !fileSystem.isDirectory(at: candidate),
+                  isTemporaryCapture(candidate) else { continue }
+            // A capture session claims its destination before creating the
+            // file and retains that claim through controller persistence. It
+            // is therefore safe for load/retry to run concurrently without
+            // moving a live or still-owned temporary capture.
+            guard !RecordingCaptureOwnershipRegistry.shared.contains(candidate) else {
+                continue
+            }
             if let artifact = moveToRecovery(candidate, kind: .temporaryCapture, prefix: "temporary") {
-                recovered = mergeRecoveryArtifact(artifact, into: recovered)
+                appendRecovered(artifact)
             } else {
                 errors.append("Could not preserve temporary capture at \(candidate.path).")
             }
         }
 
         for candidate in scan(quarantineDirectory) {
-            guard !fileSystem.isDirectory(at: candidate), isAudioFile(candidate) else { continue }
+            guard !fileSystem.isDirectory(at: candidate),
+                  isGeneratedRecoveryFile(candidate, prefix: "pending") else { continue }
             if let artifact = moveToRecovery(candidate, kind: .pendingDeletion, prefix: "pending") {
-                recovered = mergeRecoveryArtifact(artifact, into: recovered)
+                appendRecovered(artifact)
             } else {
                 errors.append("Could not preserve pending deletion at \(candidate.path).")
             }
@@ -1052,26 +1414,13 @@ final class RecordingStore: ObservableObject {
         // Recovery is intentionally not cleaned up by startup. Existing
         // artifacts are part of the repair inventory even after a restart.
         for candidate in preexistingRecoveryFiles {
-            guard !fileSystem.isDirectory(at: candidate), isAudioFile(candidate) else { continue }
-            let kind: RecordingRecoveryKind
-            let name = candidate.lastPathComponent
-            if name.hasPrefix("temporary-") {
-                kind = .temporaryCapture
-            } else if name.hasPrefix("pending-") {
-                kind = .pendingDeletion
-            } else if name.hasPrefix("recovery-") {
-                kind = .preservedAfterPersistenceFailure
-            } else {
-                kind = .orphanAudio
-            }
-            recovered = mergeRecoveryArtifact(
-                RecordingRecoveryArtifact(
-                    kind: kind,
-                    originalURL: candidate,
-                    recoveryURL: candidate
-                ),
-                into: recovered
-            )
+            guard !fileSystem.isDirectory(at: candidate),
+                  let kind = recoveryKind(for: candidate) else { continue }
+            appendRecovered(RecordingRecoveryArtifact(
+                kind: kind,
+                originalURL: candidate,
+                recoveryURL: candidate
+            ))
         }
 
         let missing = rows.filter { !availability(for: $0).isPlayable }
@@ -1115,6 +1464,22 @@ final class RecordingStore: ObservableObject {
         )
     }
 
+    private func removeRecoveryArtifactFromInventory(_ artifact: RecordingRecoveryArtifact) {
+        recoveryInventory.removeAll { existing in
+            existing.id == artifact.id
+                || samePath(existing.recoveryURL, artifact.recoveryURL)
+        }
+        publishRecoveryInventory()
+    }
+
+    private func publishRecoveryInventory() {
+        reconciliationReport = RecordingReconciliationReport(
+            missingRecordings: missingRecordings,
+            recoveredArtifacts: recoveryInventory,
+            errors: reconciliationReport.errors
+        )
+    }
+
     private func mergeRecoveryArtifact(
         _ artifact: RecordingRecoveryArtifact,
         into artifacts: [RecordingRecoveryArtifact]
@@ -1129,7 +1494,8 @@ final class RecordingStore: ObservableObject {
     }
 
     private func samePath(_ lhs: URL?, _ rhs: URL?) -> Bool {
-        lhs?.standardizedFileURL.path == rhs?.standardizedFileURL.path
+        guard let lhs, let rhs else { return false }
+        return lhs.standardizedFileURL.path == rhs.standardizedFileURL.path
     }
 
     private func quarantineURLFor(_ recording: Recording) -> URL {
@@ -1146,12 +1512,92 @@ final class RecordingStore: ObservableObject {
         return supportedExtensions.contains(url.pathExtension.lowercased())
     }
 
+    private func isAppGeneratedRecordingFile(_ url: URL) -> Bool {
+        guard isAudioFile(url) else { return false }
+        let stem = url.deletingPathExtension().lastPathComponent
+        let uuidPattern = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+        return stem.range(
+            of: "^[0-9]{10,}-\(uuidPattern)$",
+            options: .regularExpression
+        ) != nil
+    }
+
     private func isTemporaryCapture(_ url: URL) -> Bool {
         guard isAudioFile(url) else { return false }
         let name = url.deletingPathExtension().lastPathComponent
-        return name.hasPrefix("recording-")
-            || name.hasPrefix("temporary-")
+        return isGeneratedUUIDStem(name, prefix: "recording", requiresSuffix: false)
+            || isGeneratedUUIDStem(name, prefix: "temporary", requiresSuffix: true)
             || name.range(of: "^[0-9]{10,}$", options: .regularExpression) != nil
+    }
+
+    private func isGeneratedRecoveryFile(_ url: URL, prefix: String) -> Bool {
+        guard isAudioFile(url) else { return false }
+        return isGeneratedUUIDStem(
+            url.deletingPathExtension().lastPathComponent,
+            prefix: prefix,
+            requiresSuffix: true
+        )
+    }
+
+    private func isGeneratedUUIDStem(
+        _ stem: String,
+        prefix: String,
+        requiresSuffix: Bool
+    ) -> Bool {
+        let uuidPattern = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+        let suffixPattern = requiresSuffix ? "-.+" : ""
+        return stem.range(
+            of: "^\(prefix)-\(uuidPattern)\(suffixPattern)$",
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func recoveryKind(for url: URL) -> RecordingRecoveryKind? {
+        guard isAudioFile(url) else { return nil }
+        let stem = url.deletingPathExtension().lastPathComponent
+        if isGeneratedUUIDStem(stem, prefix: "temporary", requiresSuffix: true) {
+            return .temporaryCapture
+        }
+        if isGeneratedUUIDStem(stem, prefix: "pending", requiresSuffix: true) {
+            return .pendingDeletion
+        }
+        if isGeneratedUUIDStem(stem, prefix: "recovery", requiresSuffix: true) {
+            return .preservedAfterPersistenceFailure
+        }
+        if isGeneratedUUIDStem(stem, prefix: "orphan", requiresSuffix: true) {
+            return .orphanAudio
+        }
+        return nil
+    }
+
+    private func recoveryArtifactFileURLs(
+        for artifact: RecordingRecoveryArtifact
+    ) -> [URL] {
+        var urls: [URL] = []
+
+        func appendUnique(_ url: URL?) {
+            guard let url else { return }
+            let standardized = url.standardizedFileURL
+            guard !urls.contains(where: { $0.standardizedFileURL == standardized }) else {
+                return
+            }
+            urls.append(url)
+        }
+
+        appendUnique(artifact.transcriptURL)
+        appendUnique(artifact.metadataURL)
+        if artifact.kind == .preservedAfterPersistenceFailure,
+           let audioURL = artifact.recoveryURL {
+            appendUnique(audioURL.appendingPathExtension("txt"))
+            appendUnique(audioURL.appendingPathExtension("json"))
+        }
+        appendUnique(artifact.recoveryURL)
+        return urls
+    }
+
+    private func isDirectChild(_ url: URL, of directory: URL) -> Bool {
+        url.standardizedFileURL.deletingLastPathComponent().path
+            == directory.standardizedFileURL.path
     }
 
     private func safeBasename(_ name: String, fallback: String) -> String {

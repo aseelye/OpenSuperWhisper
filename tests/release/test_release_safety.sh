@@ -311,6 +311,19 @@ test_build_failure_and_dsym() {
     pass "build failure is safe and dSYM artifact uses an absolute zip destination"
 }
 
+test_project_root_is_honored_outside_repository() {
+    new_repo project-root
+    (
+        cd "$TMP_ROOT"
+        run_make
+    )
+    assert_file "$TEST_REPO/build/release/OpenSuperWhisper.dmg"
+    canonical_repo=$(CDPATH= cd -- "$TEST_REPO" && pwd -P)
+    assert_contains "-project $canonical_repo/OpenSuperWhisper.xcodeproj" "$FAKE_TOOL_LOG"
+    [ ! -d "$TMP_ROOT/build" ] || fail "build output escaped the selected project root"
+    pass "release build anchors xcodebuild to the selected project root"
+}
+
 test_no_dsym() {
     new_repo no-dsym
     FAKE_NO_DSYM=1
@@ -319,6 +332,31 @@ test_no_dsym() {
     assert_contains 'DSYM=none' "$TEST_REPO/build/release/release-manifest.txt"
     [ ! -f "$TEST_REPO/build/release/OpenSuperWhisper.app.dSYM.zip" ] || fail "stale dSYM artifact remained"
     pass "missing dSYM is represented safely in the manifest"
+}
+
+test_origin_credentials_are_redacted() {
+    new_repo origin-credentials
+    ORIGIN_TOKEN="origin-token-never-print"
+    "$REAL_GIT" -C "$TEST_REPO" remote set-url origin \
+        "https://release-user:${ORIGIN_TOKEN}@github.com/example/open-super-whisper.git"
+    run_make
+
+    MANIFEST="$TEST_REPO/build/release/release-manifest.txt"
+    assert_contains 'ORIGIN_URL=https://github.com/example/open-super-whisper.git' "$MANIFEST"
+    assert_not_contains "$ORIGIN_TOKEN" "$MANIFEST"
+
+    set +e
+    run_publish --publish --confirm >"$TEST_REPO/publish.out" 2>&1
+    publish_status=$?
+    set -e
+    if [ "$publish_status" -ne 0 ]; then
+        cat "$TEST_REPO/publish.out" >&2
+        fail "credential-bearing origin publish failed"
+    fi
+    assert_not_contains "$ORIGIN_TOKEN" "$TEST_REPO/publish.out"
+    assert_not_contains "$ORIGIN_TOKEN" "$FAKE_GH_LOG"
+    assert_contains '--repo example/open-super-whisper' "$FAKE_GH_LOG"
+    pass "credential-bearing origin URLs are redacted from manifests and GitHub arguments"
 }
 
 test_manifest_and_publish_guards() {
@@ -389,7 +427,9 @@ test_dirty_tree
 test_missing_tool
 test_missing_credential
 test_build_failure_and_dsym
+test_project_root_is_honored_outside_repository
 test_no_dsym
+test_origin_credentials_are_redacted
 test_manifest_and_publish_guards
 test_secret_and_publish
 test_verify_never_publishes

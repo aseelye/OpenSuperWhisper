@@ -58,6 +58,38 @@ absolute_from_root() {
     esac
 }
 
+sanitize_origin_url() {
+    origin_url="$1"
+    case "$origin_url" in
+        *$'\n'*|*$'\r'*) die "origin URL contains a line break" ;;
+    esac
+
+    # Git's HTTP/SSH URL forms may contain user-info before the host. The
+    # remote remains configured as-is, but manifests must never retain a
+    # credential-bearing origin. scp-style git@host:path URLs have no URL
+    # authority and are already safe to preserve.
+    case "$origin_url" in
+        *://*)
+            origin_scheme=${origin_url%%://*}
+            origin_rest=${origin_url#*://}
+            origin_authority=${origin_rest%%/*}
+            origin_path=""
+            case "$origin_rest" in
+                */*) origin_path=${origin_rest#*/} ;;
+            esac
+            origin_host=${origin_authority##*@}
+            if [ -n "$origin_path" ]; then
+                printf '%s://%s/%s\n' "$origin_scheme" "$origin_host" "$origin_path"
+            else
+                printf '%s://%s\n' "$origin_scheme" "$origin_host"
+            fi
+            ;;
+        *)
+            printf '%s\n' "$origin_url"
+            ;;
+    esac
+}
+
 assert_safe_child() {
     candidate="$1"
     label="$2"
@@ -279,6 +311,7 @@ FINAL_VERSION=$(project_version "$PROJECT_FILE")
 DMG_REL=${DMG_PATH#"$PROJECT_ROOT"/}
 DMG_SHA_REL=${DMG_SHA_PATH#"$PROJECT_ROOT"/}
 REPOSITORY_URL=$(git -C "$PROJECT_ROOT" config --get remote.origin.url 2>/dev/null || true)
+REPOSITORY_URL=$(sanitize_origin_url "$REPOSITORY_URL")
 MANIFEST_TMP="$MANIFEST_PATH.tmp.$$"
 trap 'rm -f "$MANIFEST_TMP"' EXIT HUP INT TERM
 umask 077

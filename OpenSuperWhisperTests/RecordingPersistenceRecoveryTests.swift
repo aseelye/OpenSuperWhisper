@@ -90,17 +90,45 @@ final class RecordingPersistenceRecoveryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
     }
 
+    func testBulkDeletionReconcilesOnlyOnceAfterRemovingAllRows() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let fileSystem = FailingRecordingFileSystem(failRemovePaths: [])
+        let store = fixture.makeStore(fileSystem: fileSystem)
+
+        for index in 0..<3 {
+            let recording = makeRecording(fileName: "bulk-\(index).wav")
+            try Data([UInt8(index)]).write(to: store.url(for: recording))
+            _ = try await store.commitRecording(recording)
+        }
+        fileSystem.contentsOfDirectoryCallCount = 0
+
+        let result = await store.deleteAllRecordingsAndAwait()
+
+        XCTAssertNil(result.error)
+        XCTAssertEqual(result.results.count, 3)
+        XCTAssertTrue(result.results.allSatisfy(\.succeeded))
+        XCTAssertTrue(store.recordings.isEmpty)
+        XCTAssertEqual(fileSystem.contentsOfDirectoryCallCount, 4)
+    }
+
     func testReconciliationQuarantinesOrphansAndIsIdempotent() async throws {
         let fixture = try makeFixture()
         defer { fixture.remove() }
         let store = fixture.makeStore()
         try FileManager.default.createDirectory(at: fixture.recordingsDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: fixture.temporaryDirectory, withIntermediateDirectories: true)
-        let orphan = fixture.recordingsDirectory.appendingPathComponent("orphan.wav")
-        let temporary = fixture.temporaryDirectory.appendingPathComponent("recording-123.wav")
+        let orphan = fixture.recordingsDirectory.appendingPathComponent(
+            "1700000000000-\(UUID().uuidString).wav"
+        )
+        let temporary = fixture.temporaryDirectory.appendingPathComponent(
+            "recording-\(UUID().uuidString).wav"
+        )
+        let unknownAudio = fixture.recordingsDirectory.appendingPathComponent("manual.wav")
         let untouched = fixture.recordingsDirectory.appendingPathComponent("notes.txt")
         try Data([1]).write(to: orphan)
         try Data([2]).write(to: temporary)
+        try Data([4]).write(to: unknownAudio)
         try Data([3]).write(to: untouched)
 
         let first = await store.reconcile()
@@ -115,7 +143,30 @@ final class RecordingPersistenceRecoveryTests: XCTestCase {
         })
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporary.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unknownAudio.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: untouched.path))
+    }
+
+    func testActiveTemporaryCaptureIsNotReconciledUntilOwnershipIsReleased() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let store = fixture.makeStore()
+        let captureURL = fixture.temporaryDirectory.appendingPathComponent(
+            "recording-\(UUID().uuidString).wav"
+        )
+        try Data([21, 22]).write(to: captureURL)
+
+        let lease = RecordingCaptureOwnershipRegistry.shared.acquire(captureURL)
+        let activeReport = await store.reconcile()
+
+        XCTAssertTrue(activeReport.temporaryCaptures.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: captureURL.path))
+
+        lease.release()
+        let releasedReport = await store.reconcile()
+
+        XCTAssertEqual(releasedReport.temporaryCaptures.count, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: captureURL.path))
     }
 
     func testMissingAudioPreservesRowAndReportsUnavailableState() async throws {
@@ -165,6 +216,158 @@ final class RecordingPersistenceRecoveryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
         let transcript = try String(contentsOf: try XCTUnwrap(receipt.transcriptURL), encoding: .utf8)
         XCTAssertEqual(transcript, recording.transcription)
+    }
+
+    func testRecoveryArtifactDeletionRemovesAudioAndSidecars() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let store = fixture.makeStore()
+        let source = fixture.directory.appendingPathComponent("recovery-source.wav")
+        try Data([31, 32]).write(to: source)
+        let recording = makeRecording(fileName: "recovery-source.wav", transcription: "keep transcript")
+
+        let receipt = try await store.preserveAudioForRecovery(
+            from: source,
+            recording: recording,
+            disposition: .move
+        )
+        let artifact = try XCTUnwrap(store.recoveryItems.first)
+        let result = await store.deleteRecoveryArtifactAndAwait(artifact)
+
+        XCTAssertEqual(result.state, .deleted)
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(store.recoveryItems.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(receipt.audioURL).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(receipt.transcriptURL).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(receipt.metadataURL).path))
+    }
+
+    func testRecoveryArtifactDeletionFailureKeepsInventoryForRetry() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let fileSystem = FailingRecordingFileSystem(failRemovePaths: [])
+        let store = fixture.makeStore(fileSystem: fileSystem)
+        let source = fixture.directory.appendingPathComponent("recovery-failure.wav")
+        try Data([41]).write(to: source)
+        let recording = makeRecording(fileName: "recovery-failure.wav")
+
+        let receipt = try await store.preserveAudioForRecovery(
+            from: source,
+            recording: recording,
+            disposition: .move
+        )
+        let artifact = try XCTUnwrap(store.recoveryItems.first)
+        let audioURL = try XCTUnwrap(receipt.audioURL)
+        fileSystem.failRemovePaths.insert(audioURL.path)
+
+        let result = await store.deleteRecoveryArtifactAndAwait(artifact)
+
+        XCTAssertEqual(result.state, .failed)
+        XCTAssertTrue(result.requiresRepair)
+        XCTAssertEqual(store.recoveryItems.count, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+    }
+
+    func testBulkRecoveryDeletionRemovesAllReviewedArtifacts() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let store = fixture.makeStore()
+        var recoveredAudioURLs: [URL] = []
+
+        for index in 0..<3 {
+            let source = fixture.directory.appendingPathComponent("bulk-recovery-\(index).wav")
+            try Data([UInt8(index)]).write(to: source)
+            let recording = makeRecording(fileName: source.lastPathComponent)
+            let receipt = try await store.preserveAudioForRecovery(
+                from: source,
+                recording: recording,
+                disposition: .move
+            )
+            recoveredAudioURLs.append(try XCTUnwrap(receipt.audioURL))
+        }
+
+        let results = await store.deleteAllRecoveryArtifactsAndAwait()
+
+        XCTAssertEqual(results.count, 3)
+        XCTAssertTrue(results.allSatisfy(\.succeeded))
+        XCTAssertTrue(store.recoveryItems.isEmpty)
+        XCTAssertTrue(recoveredAudioURLs.allSatisfy {
+            !FileManager.default.fileExists(atPath: $0.path)
+        })
+    }
+
+    func testRecoveryArtifactDeletionRejectsOutOfTreeTargets() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let store = fixture.makeStore()
+        let outside = fixture.directory.appendingPathComponent("outside.wav")
+        try Data([51]).write(to: outside)
+        let artifact = RecordingRecoveryArtifact(
+            kind: .orphanAudio,
+            originalURL: outside,
+            recoveryURL: outside
+        )
+
+        let result = await store.deleteRecoveryArtifactAndAwait(artifact)
+
+        XCTAssertEqual(result.state, .failed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path))
+    }
+
+    func testMissingAudioRepairCopiesSourceAndRetainsIt() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let store = fixture.makeStore()
+        let recording = makeRecording(fileName: "repair.wav", transcription: "repair me")
+        _ = try await store.commitRecording(recording)
+        let source = fixture.directory.appendingPathComponent("selected.wav")
+        try Data([61, 62, 63]).write(to: source)
+
+        let result = await store.restoreMissingAudio(for: recording, from: source)
+
+        XCTAssertEqual(result.state, .restored)
+        XCTAssertTrue(result.succeeded)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+        XCTAssertEqual(
+            try Data(contentsOf: store.url(for: recording)),
+            Data([61, 62, 63])
+        )
+        XCTAssertTrue(store.availability(for: recording).isPlayable)
+        XCTAssertTrue(store.missingRecordings.isEmpty)
+    }
+
+    func testMissingAudioRepairRejectsDifferentExtensionAndDoesNotCopy() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let store = fixture.makeStore()
+        let recording = makeRecording(fileName: "repair.wav")
+        _ = try await store.commitRecording(recording)
+        let source = fixture.directory.appendingPathComponent("selected.m4a")
+        try Data([71]).write(to: source)
+
+        let result = await store.restoreMissingAudio(for: recording, from: source)
+
+        XCTAssertEqual(result.state, .failed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.url(for: recording).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testMissingAudioRepairNeverOverwritesDestination() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let store = fixture.makeStore()
+        let recording = makeRecording(fileName: "repair.wav")
+        _ = try await store.commitRecording(recording)
+        let source = fixture.directory.appendingPathComponent("selected.wav")
+        try Data([81]).write(to: source)
+        let destination = store.url(for: recording)
+        try Data([82]).write(to: destination)
+
+        let result = await store.restoreMissingAudio(for: recording, from: source)
+
+        XCTAssertEqual(result.state, .alreadyPresent)
+        XCTAssertEqual(try Data(contentsOf: destination), Data([82]))
+        XCTAssertEqual(try Data(contentsOf: source), Data([81]))
     }
 
     private func makeRecording(
@@ -238,6 +441,7 @@ final class RecordingPersistenceRecoveryTests: XCTestCase {
 private final class FailingRecordingFileSystem: RecordingFileSystem {
     private let local = LocalRecordingFileSystem()
     var failRemovePaths: Set<String>
+    var contentsOfDirectoryCallCount = 0
 
     init(failRemovePaths: Set<String>) {
         self.failRemovePaths = failRemovePaths
@@ -246,7 +450,10 @@ private final class FailingRecordingFileSystem: RecordingFileSystem {
     func fileExists(at url: URL) -> Bool { local.fileExists(at: url) }
     func isDirectory(at url: URL) -> Bool { local.isDirectory(at: url) }
     func createDirectory(at url: URL) throws { try local.createDirectory(at: url) }
-    func contentsOfDirectory(at url: URL) throws -> [URL] { try local.contentsOfDirectory(at: url) }
+    func contentsOfDirectory(at url: URL) throws -> [URL] {
+        contentsOfDirectoryCallCount += 1
+        return try local.contentsOfDirectory(at: url)
+    }
     func copyItem(at sourceURL: URL, to destinationURL: URL) throws {
         try local.copyItem(at: sourceURL, to: destinationURL)
     }

@@ -55,7 +55,7 @@ xcodebuild -project OpenSuperWhisper.xcodeproj -scheme OpenSuperWhisper \
   -only-testing:OpenSuperWhisperTests test
 ```
 
-The unit target currently contains 100 tests. The default shared scheme keeps
+The unit target currently contains 118 tests. The default shared scheme keeps
 the unit target enabled and the UI target skipped; the separate
 `OpenSuperWhisperUI` scheme is serialized and opt-in.
 

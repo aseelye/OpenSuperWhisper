@@ -86,12 +86,12 @@ jobs:
           chmod +x ./run.sh
           ./run.sh build 2>&1 | tee build/logs/ci-build.log
 
-      - name: Run the 100-test unit suite serially
+      - name: Run the 118-test unit suite serially
         shell: bash
         run: |
           set -euo pipefail
           XCODE_PARALLEL_TESTING=NO XCODE_TEST_WORKERS=1 ./run.sh test 2>&1 | tee build/logs/ci-unit-test.log
-          grep -F 'Executed 100 tests, with 0 failures' build/logs/ci-unit-test.log
+          grep -F 'Executed 118 tests, with 0 failures' build/logs/ci-unit-test.log
 
       - name: Check the diff
         shell: bash

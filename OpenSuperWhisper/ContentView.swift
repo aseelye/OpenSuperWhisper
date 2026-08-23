@@ -220,6 +220,8 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var showDeleteConfirmation = false
     @State private var isDeletingAll = false
+    @State private var showDeleteAllRecoveryConfirmation = false
+    @State private var isDeletingAllRecovery = false
     @State private var historyActionMessage: String?
 
     init(
@@ -409,6 +411,15 @@ struct ContentView: View {
                     Text("\(artifacts.count) preserved recording\(artifacts.count == 1 ? "" : "s") need review.")
                         .font(.caption)
                         .foregroundColor(.secondary)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(artifacts) { artifact in
+                            RecoveryArtifactRow(
+                                artifact: artifact,
+                                recordingStore: recordingStore
+                            )
+                        }
+                    }
                 }
                 if !reconciliationErrors.isEmpty {
                     Text(reconciliationErrors.joined(separator: "; "))
@@ -416,11 +427,52 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
                 }
-                Button("Open Recovery Folder") {
-                    NSWorkspace.shared.open(recordingStore.recoveryDirectory)
+                HStack {
+                    Button("Open Recovery Folder") {
+                        NSWorkspace.shared.open(recordingStore.recoveryDirectory)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Open Recovery folder")
+
+                    if !artifacts.isEmpty {
+                        Button {
+                            showDeleteAllRecoveryConfirmation = true
+                        } label: {
+                            if isDeletingAllRecovery {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("Delete All Recovered…")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isDeletingAllRecovery)
+                        .confirmationDialog(
+                            "Delete all recovered recordings?",
+                            isPresented: $showDeleteAllRecoveryConfirmation,
+                            titleVisibility: .visible
+                        ) {
+                            Button(
+                                "Delete \(artifacts.count) Recovered Recordings",
+                                role: .destructive
+                            ) {
+                                isDeletingAllRecovery = true
+                                Task { @MainActor in
+                                    let results = await recordingStore
+                                        .deleteAllRecoveryArtifactsAndAwait()
+                                    isDeletingAllRecovery = false
+                                    let failures = results.filter { !$0.succeeded }
+                                    if !failures.isEmpty {
+                                        historyActionMessage = "\(failures.count) recovered recording\(failures.count == 1 ? "" : "s") could not be deleted."
+                                    }
+                                }
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("This permanently removes all preserved audio and Recovery sidecars. This action cannot be undone.")
+                        }
+                        .accessibilityLabel("Delete all recovered recordings")
+                    }
                 }
-                .buttonStyle(.bordered)
-                .accessibilityLabel("Open Recovery folder")
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -541,11 +593,11 @@ struct ContentView: View {
                 Spacer()
 
                 if !recordingStore.recordings.isEmpty {
-                    Button("Clear All") { showDeleteConfirmation = true }
+                    Button("Clear History") { showDeleteConfirmation = true }
                         .buttonStyle(.plain)
                         .disabled(isDeletingAll)
                         .confirmationDialog(
-                            "Delete All Recordings",
+                            "Delete All History",
                             isPresented: $showDeleteConfirmation,
                             titleVisibility: .visible
                         ) {
@@ -566,7 +618,7 @@ struct ContentView: View {
                         } message: {
                             Text("This removes the selected history and its managed audio files.")
                         }
-                        .accessibilityLabel("Delete all recordings")
+                        .accessibilityLabel("Delete all history recordings")
                 }
 
                 Button {
@@ -580,6 +632,121 @@ struct ContentView: View {
             }
         }
         .padding()
+    }
+}
+
+/// A single Recovery item is independently actionable. Deleting one item
+/// must not hide the other artifacts or require users to manage the folder in
+/// Finder, while all destructive filesystem work remains owned by the store.
+struct RecoveryArtifactRow: View {
+    let artifact: RecordingRecoveryArtifact
+    @ObservedObject var recordingStore: RecordingStore
+    @State private var isDeleting = false
+    @State private var showDeleteConfirmation = false
+    @State private var actionError: String?
+
+    private var displayURL: URL? {
+        artifact.recoveryURL ?? artifact.transcriptURL ?? artifact.metadataURL
+    }
+
+    private var displayName: String {
+        displayURL?.lastPathComponent
+            ?? artifact.originalURL.lastPathComponent
+    }
+
+    private var kindDescription: String {
+        switch artifact.kind {
+        case .orphanAudio:
+            return "Orphaned audio"
+        case .temporaryCapture:
+            return "Unfinished capture"
+        case .pendingDeletion:
+            return "Pending deletion"
+        case .preservedAfterPersistenceFailure:
+            return "Preserved after history failure"
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: "waveform.badge.exclamationmark")
+                .foregroundColor(.orange)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayName)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(kindDescription)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            if let displayURL {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([displayURL])
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .buttonStyle(.plain)
+                .help("Reveal recovered file")
+                .accessibilityLabel("Reveal recovered file \(displayName)")
+            }
+
+            Button {
+                showDeleteConfirmation = true
+            } label: {
+                if isDeleting {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "trash")
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .disabled(isDeleting)
+            .help("Delete recovered artifact")
+            .accessibilityLabel("Delete recovered artifact \(displayName)")
+        }
+        .padding(.vertical, 4)
+        .confirmationDialog(
+            "Delete recovered artifact?",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                deleteArtifact()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently removes the preserved audio and any Recovery sidecars. This action cannot be undone.")
+        }
+        .alert(
+            "Recovery action failed",
+            isPresented: Binding(
+                get: { actionError != nil },
+                set: { if !$0 { actionError = nil } }
+            ),
+            actions: { Button("OK", role: .cancel) {} },
+            message: { Text(actionError ?? "The Recovery artifact could not be removed.") }
+        )
+    }
+
+    private func deleteArtifact() {
+        guard !isDeleting else { return }
+        isDeleting = true
+        Task { @MainActor in
+            let result = await recordingStore.deleteRecoveryArtifactAndAwait(artifact)
+            isDeleting = false
+            if !result.succeeded {
+                actionError = result.error?.localizedDescription
+                    ?? "The Recovery artifact could not be removed."
+            }
+        }
     }
 }
 
@@ -687,6 +854,7 @@ struct RecordingRow: View {
     @State private var showTimingDetails = false
     @State private var isHovered = false
     @State private var isDeleting = false
+    @State private var isRepairingAudio = false
     @State private var actionError: String?
     @AppStorage("showTimingDetailsInHistory") private var showTimingDetailsInHistory = false
 
@@ -757,8 +925,22 @@ struct RecordingRow: View {
                     Label("Audio unavailable", systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundColor(.orange)
-                    Button("Locate Audio…") { revealAudioLocation() }
+                    Button {
+                        chooseReplacementAudio()
+                    } label: {
+                        if isRepairingAudio {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Repairing…")
+                        } else {
+                            Text("Locate Audio…")
+                        }
+                    }
                         .buttonStyle(.plain)
+                        .disabled(isRepairingAudio)
+                        .accessibilityLabel(
+                            isRepairingAudio ? "Repairing missing audio" : "Locate missing audio"
+                        )
                 }
                 if isHovered || isPlaying || availability.isMissing {
                     HStack(spacing: 14) {
@@ -837,9 +1019,40 @@ struct RecordingRow: View {
         )
     }
 
-    private func revealAudioLocation() {
-        let url = recordingStore.url(for: recording)
-        NSWorkspace.shared.activateFileViewerSelecting([url.deletingLastPathComponent()])
+    private func chooseReplacementAudio() {
+        guard !isRepairingAudio else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.audio]
+        panel.title = "Locate Recording Audio"
+        panel.message = "Choose the original audio file for this recording."
+
+        panel.begin { response in
+            guard response == .OK, let sourceURL = panel.url else { return }
+            Task { @MainActor in
+                await repairAudio(from: sourceURL)
+            }
+        }
+    }
+
+    private func repairAudio(from sourceURL: URL) async {
+        guard !isRepairingAudio else { return }
+        isRepairingAudio = true
+        let result = await recordingStore.restoreMissingAudio(
+            for: recording,
+            from: sourceURL
+        )
+        isRepairingAudio = false
+
+        if result.succeeded {
+            _ = await recordingStore.loadRecordings()
+        } else {
+            actionError = result.error?.localizedDescription
+                ?? "The missing audio could not be restored."
+        }
     }
 
     private static func timeRangeDescription(for segment: TranscriptSegment) -> String {

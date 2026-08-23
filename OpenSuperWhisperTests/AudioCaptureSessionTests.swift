@@ -149,6 +149,28 @@ final class AudioCaptureSessionTests: XCTestCase {
         _ = try await replacement.stopAndDrain()
         XCTAssertEqual(callbacks.value, [1, 13])
     }
+
+    func testCaptureOwnershipIsClaimedBeforeStartAndReleasedAfterTeardown() async throws {
+        let harness = try CaptureHarness()
+        let destination = harness.configuration.temporaryDirectory
+            .appendingPathComponent("recording-\(UUID().uuidString).wav")
+        var session: AudioCaptureSession? = harness.makeSession(fileURL: destination)
+
+        XCTAssertTrue(RecordingCaptureOwnershipRegistry.shared.contains(destination))
+        try await session?.start { _ in }
+        _ = try await session?.stopAndDrain()
+        XCTAssertTrue(
+            RecordingCaptureOwnershipRegistry.shared.contains(destination),
+            "Stopping capture must not release ownership before persistence finishes."
+        )
+
+        session = nil
+        for _ in 0..<32 {
+            if !RecordingCaptureOwnershipRegistry.shared.contains(destination) { break }
+            await Task.yield()
+        }
+        XCTAssertFalse(RecordingCaptureOwnershipRegistry.shared.contains(destination))
+    }
 }
 
 // MARK: Test seam implementations
@@ -180,7 +202,10 @@ private final class CaptureHarness {
         self.copier = TestCaptureCopier(error: copyError)
     }
 
-    func makeSession(generation: UInt64 = 1) -> AudioCaptureSession {
+    func makeSession(
+        generation: UInt64 = 1,
+        fileURL: URL? = nil
+    ) -> AudioCaptureSession {
         AudioCaptureSession(
             configuration: configuration,
             dependencies: AudioCaptureDependencies(
@@ -190,7 +215,8 @@ private final class CaptureHarness {
                 fileSystem: fileSystem,
                 callbackExecutorFactory: TestCallbackExecutorFactory()
             ),
-            generation: generation
+            generation: generation,
+            fileURL: fileURL
         )
     }
 

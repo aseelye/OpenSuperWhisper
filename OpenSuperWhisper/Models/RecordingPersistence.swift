@@ -289,6 +289,7 @@ struct RecordingRecoveryArtifact: Identifiable, Codable, Equatable, Sendable {
     let originalURL: URL
     let recoveryURL: URL?
     let transcriptURL: URL?
+    let metadataURL: URL?
     let recordingID: UUID?
 
     init(
@@ -297,6 +298,7 @@ struct RecordingRecoveryArtifact: Identifiable, Codable, Equatable, Sendable {
         originalURL: URL,
         recoveryURL: URL?,
         transcriptURL: URL? = nil,
+        metadataURL: URL? = nil,
         recordingID: UUID? = nil
     ) {
         self.id = id
@@ -304,6 +306,7 @@ struct RecordingRecoveryArtifact: Identifiable, Codable, Equatable, Sendable {
         self.originalURL = originalURL
         self.recoveryURL = recoveryURL
         self.transcriptURL = transcriptURL
+        self.metadataURL = metadataURL
         self.recordingID = recordingID
     }
 }
@@ -415,6 +418,77 @@ struct RecordingRecoveryReceipt: Identifiable, Equatable, Sendable {
         self.transcriptURL = transcriptURL
         self.metadataURL = metadataURL
     }
+}
+
+enum RecordingRecoveryDeletionState: Equatable, Sendable {
+    case deleted
+    case alreadyAbsent
+    case failed
+}
+
+/// Result of deleting one reviewed Recovery artifact.  The artifact remains
+/// in the store's repair inventory whenever any requested file could not be
+/// removed, so a partial filesystem failure stays actionable.
+struct RecordingRecoveryDeletionResult: Equatable, Sendable {
+    let artifactID: UUID
+    let state: RecordingRecoveryDeletionState
+    let removedURLs: [URL]
+    let error: RecordingStoreError?
+
+    init(
+        artifactID: UUID,
+        state: RecordingRecoveryDeletionState,
+        removedURLs: [URL] = [],
+        error: RecordingStoreError? = nil
+    ) {
+        self.artifactID = artifactID
+        self.state = state
+        self.removedURLs = removedURLs
+        self.error = error
+    }
+
+    var succeeded: Bool {
+        error == nil && (state == .deleted || state == .alreadyAbsent)
+    }
+
+    var requiresRepair: Bool { state == .failed }
+}
+
+enum RecordingAudioRepairState: Equatable, Sendable {
+    case restored
+    case alreadyPresent
+    case failed
+}
+
+/// Result of copying a user-selected replacement into a recording's managed
+/// path.  The source is intentionally retained, so the result describes a
+/// copy rather than a move/import ownership transfer.
+struct RecordingAudioRepairResult: Equatable, Sendable {
+    let recordingID: UUID
+    let state: RecordingAudioRepairState
+    let sourceURL: URL
+    let destinationURL: URL
+    let error: RecordingStoreError?
+
+    init(
+        recordingID: UUID,
+        state: RecordingAudioRepairState,
+        sourceURL: URL,
+        destinationURL: URL,
+        error: RecordingStoreError? = nil
+    ) {
+        self.recordingID = recordingID
+        self.state = state
+        self.sourceURL = sourceURL
+        self.destinationURL = destinationURL
+        self.error = error
+    }
+
+    var succeeded: Bool {
+        error == nil && (state == .restored || state == .alreadyPresent)
+    }
+
+    var requiresRepair: Bool { state == .failed }
 }
 
 /// Small filesystem seam used by deletion/recovery tests.  The production

@@ -263,11 +263,10 @@ private final actor AppleSpeechLiveTranscriptionSession: AppleSpeechLiveSessionD
     private let transcriber: SpeechTranscriber
     private let locale: Locale
     private let targetFormat: AVAudioFormat
-    private var analyzerTask: Task<Void, Error>?
+    private var analyzerTask: Task<CMTime?, Error>?
     private var resultTask: Task<Void, Error>?
     private var converter: AVAudioConverter?
     private var lastInputFormat: AVAudioFormat?
-    private var nextBufferStart: TimeInterval = 0
     private var assembler: TranscriptAssembler
     private var analyzerError: Error?
     private var lifecycleState: LifecycleState = .active
@@ -346,7 +345,11 @@ private final actor AppleSpeechLiveTranscriptionSession: AppleSpeechLiveSessionD
         }
         analyzerTask = Task { [weak self, analyzer] in
             do {
-                try await analyzer.start(inputSequence: inputStream)
+                // Keep the analysis task alive until the input sequence ends.
+                // Apple's structured API also returns the last consumed time,
+                // which gives finalization an exact boundary instead of racing
+                // an autonomous `start(inputSequence:)` session.
+                return try await analyzer.analyzeSequence(inputStream)
             } catch is CancellationError {
                 throw CoreTranscriptionError.cancelled
             } catch {
@@ -383,9 +386,10 @@ private final actor AppleSpeechLiveTranscriptionSession: AppleSpeechLiveSessionD
         if let analyzerError { throw analyzerError }
 
         let converted = try convert(buffer: buffer)
-        let start = CMTime(seconds: nextBufferStart, preferredTimescale: 1_000)
-        nextBufferStart += Double(converted.frameLength) / converted.format.sampleRate
-        inputContinuation?.yield(AnalyzerInput(buffer: converted, bufferStartTime: start))
+        // A nil start time means this is contiguous live input. SpeechAnalyzer
+        // derives timing from the buffers and avoids accumulated resampling
+        // rounding error being interpreted as disordered audio.
+        inputContinuation?.yield(AnalyzerInput(buffer: converted))
     }
 
     func finish() async throws -> Transcript {
@@ -410,9 +414,16 @@ private final actor AppleSpeechLiveTranscriptionSession: AppleSpeechLiveSessionD
         }
 
         do {
-            try await analyzer.finalizeAndFinishThroughEndOfInput()
+            guard let analyzerTask else {
+                throw CoreTranscriptionError.analyzerFailed("Speech analysis did not start.")
+            }
+            let lastSampleTime = try await analyzerTask.value
             try checkFinalizationWasNotCancelled()
-            if let analyzerTask { _ = try await analyzerTask.value }
+            if let lastSampleTime {
+                try await analyzer.finalizeAndFinish(through: lastSampleTime)
+            } else {
+                await analyzer.cancelAndFinishNow()
+            }
             try checkFinalizationWasNotCancelled()
             if let resultTask { _ = try await resultTask.value }
             try checkFinalizationWasNotCancelled()
@@ -672,8 +683,7 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
         case cached(Transcript)
         case cancelled
         case notStarted
-        case alreadyFinishing(any AppleSpeechLiveSessionDriver)
-        case begin(any AppleSpeechLiveSessionDriver, Task<Void, Error>?)
+        case finishing(Task<Transcript, Error>)
     }
 
     public let events: AsyncStream<TranscriptionOperationEvent>
@@ -695,6 +705,7 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
     private var consumerTask: Task<Void, Error>?
     private var monitorTask: Task<Void, Never>?
     private var cancellationTask: Task<Void, Never>?
+    private var finalizationTask: Task<Transcript, Error>?
     private var terminal: CoreTranscriptionError?
     private var finalTranscript: Transcript?
     private var started = false
@@ -758,9 +769,9 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
 
     public func append(buffer: AVAudioPCMBuffer) async throws {
         let admissionState = stateLock.withLock { (started, finished, cancelled, terminal) }
-        guard admissionState.0 else { throw TranscriptionLiveInputError.notStarted }
         if let terminal = admissionState.3 { throw terminal }
         if admissionState.1 || admissionState.2 { throw TranscriptionLiveInputError.cancelled }
+        guard admissionState.0 else { throw TranscriptionLiveInputError.notStarted }
         do {
             try await channel.append(buffer: buffer)
         } catch let error as TranscriptionLiveInputError {
@@ -782,8 +793,6 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
 
     public func finish() async throws -> Transcript {
         let reservation = reserveFinish()
-        let driver: any AppleSpeechLiveSessionDriver
-        let consumer: Task<Void, Error>?
         switch reservation {
         case let .terminal(error):
             throw error
@@ -793,27 +802,45 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
             throw CoreTranscriptionError.cancelled
         case .notStarted:
             throw TranscriptionLiveInputError.notStarted
-        case let .alreadyFinishing(currentDriver):
-            return try await currentDriver.finish()
-        case let .begin(currentDriver, consumerTask):
-            driver = currentDriver
-            consumer = consumerTask
+        case let .finishing(task):
+            do {
+                return try await withTaskCancellationHandler(operation: {
+                    try await task.value
+                }, onCancel: {
+                    Task { await self.cancelAndWait() }
+                })
+            } catch is CancellationError {
+                await cancelAndWait()
+                throw CoreTranscriptionError.cancelled
+            }
         }
+    }
 
+    private func performFinalization(
+        driver: any AppleSpeechLiveSessionDriver,
+        consumer: Task<Void, Error>?
+    ) async throws -> Transcript {
         emit(.finalizingAudio)
         channel.finish()
         do {
             try await consumer?.value
-            if let terminal = stateLock.withLock({ self.terminal }) { throw terminal }
+            try checkFinalizationState()
             emit(.transcribing)
             let transcript = try await driver.finish()
+            try checkFinalizationState()
             if let terminal = await driver.terminalError() { throw terminal }
-            stateLock.withLock { finalTranscript = transcript }
-            await quiesceMonitor()
-            stateLock.withLock {
+            try checkFinalizationState()
+
+            let committed = stateLock.withLock { () -> Bool in
+                guard !cancelled, terminal == nil, finalTranscript == nil else { return false }
+                finalTranscript = transcript
                 self.driver = nil
-                self.started = false
+                started = false
+                return true
             }
+            guard committed else { throw CoreTranscriptionError.cancelled }
+
+            await quiesceMonitor()
             diagnosticSink.record(
                 TranscriptionDiagnosticEvent(
                     operationToken: operationToken,
@@ -826,21 +853,12 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
             finishStreams()
             return transcript
         } catch is CancellationError {
-            await cancelAndWait()
-            throw CoreTranscriptionError.cancelled
+            throw await failFinalization(with: .cancelled, driver: driver)
         } catch let error as CoreTranscriptionError {
-            recordTerminal(error)
-            await releaseAndCancel(driver)
-            await quiesceMonitor()
-            finishStreams()
-            throw error
+            throw await failFinalization(with: error, driver: driver)
         } catch {
             let typed = error as? CoreTranscriptionError ?? .analyzerFailed(error.localizedDescription)
-            recordTerminal(typed)
-            await releaseAndCancel(driver)
-            await quiesceMonitor()
-            finishStreams()
-            throw typed
+            throw await failFinalization(with: typed, driver: driver)
         }
     }
 
@@ -852,9 +870,20 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
             guard started, let currentDriver = self.driver else {
                 return .notStarted
             }
-            if finished { return .alreadyFinishing(currentDriver) }
+            if finished {
+                // The first reservation installs the task while holding the
+                // same lock that publishes `finished`; cancellation can
+                // therefore never observe a finishing operation without a
+                // task it can await.
+                guard let finalizationTask else { return .cancelled }
+                return .finishing(finalizationTask)
+            }
             finished = true
-            return .begin(currentDriver, consumerTask)
+            let task = Task { [self, driver = currentDriver, consumer = consumerTask] in
+                try await performFinalization(driver: driver, consumer: consumer)
+            }
+            finalizationTask = task
+            return .finishing(task)
         }
     }
 
@@ -975,7 +1004,7 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
             consumer: Task<Void, Error>?,
             monitor: Task<Void, Never>?,
             driver: (any AppleSpeechLiveSessionDriver)?,
-            wasFinished: Bool
+            finalization: Task<Transcript, Error>?
         ) = stateLock.withLock {
             cancelled = true
             let snapshot = (
@@ -983,7 +1012,7 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
                 consumer: consumerTask,
                 monitor: monitorTask,
                 driver: self.driver,
-                wasFinished: finished
+                finalization: finalizationTask
             )
             self.driver = nil
             started = false
@@ -993,19 +1022,37 @@ public final class AppleSpeechLiveTranscriptionOperation: @unchecked Sendable, T
         let consumer = snapshot.consumer
         let monitor = snapshot.monitor
         let driver = snapshot.driver
-        let wasFinished = snapshot.wasFinished
+        let finalization = snapshot.finalization
         emit(.cancelling)
         channel.cancel()
         start?.cancel()
         consumer?.cancel()
         monitor?.cancel()
-        if !wasFinished {
-            if let driver { await driver.cancelAndWait() }
-        }
+        finalization?.cancel()
+        if let driver { await driver.cancelAndWait() }
         _ = try? await start?.value
         _ = try? await consumer?.value
         _ = await monitor?.value
+        _ = try? await finalization?.value
         finishStreams()
+    }
+
+    private func checkFinalizationState() throws {
+        let state = stateLock.withLock { (cancelled, terminal) }
+        if let terminal = state.1 { throw terminal }
+        if state.0 || Task.isCancelled { throw CoreTranscriptionError.cancelled }
+    }
+
+    private func failFinalization(
+        with error: CoreTranscriptionError,
+        driver: any AppleSpeechLiveSessionDriver
+    ) async -> CoreTranscriptionError {
+        recordTerminal(error)
+        let effectiveError = stateLock.withLock { terminal ?? error }
+        await releaseAndCancel(driver)
+        await quiesceMonitor()
+        finishStreams()
+        return effectiveError
     }
 
     private func requestCancellation() {

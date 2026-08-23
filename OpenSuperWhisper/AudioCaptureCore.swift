@@ -191,3 +191,75 @@ public protocol DictationAudioCaptureSession: AnyObject, Sendable {
 public protocol DictationAudioCaptureFactory: Sendable {
     func makeSession() -> any DictationAudioCaptureSession
 }
+
+// MARK: - Recording-file ownership
+
+/// Process-local ownership for a capture destination. Reconciliation can run
+/// on MainActor while a capture session is still creating or writing its
+/// temporary file, so existence alone is not enough to identify an abandoned
+/// capture. Claims are path-normalized and reference-counted to keep test or
+/// replacement sessions using the same explicit URL from releasing one
+/// another's protection.
+final class RecordingCaptureOwnershipRegistry: @unchecked Sendable {
+    static let shared = RecordingCaptureOwnershipRegistry()
+
+    private let lock = NSLock()
+    private var claims: [String: Int] = [:]
+
+    private init() {}
+
+    func acquire(_ url: URL) -> RecordingCaptureOwnershipLease {
+        let key = Self.key(for: url)
+        lock.withLock {
+            claims[key, default: 0] += 1
+        }
+        return RecordingCaptureOwnershipLease(registry: self, key: key)
+    }
+
+    func contains(_ url: URL) -> Bool {
+        let key = Self.key(for: url)
+        return lock.withLock { (claims[key] ?? 0) > 0 }
+    }
+
+    fileprivate func release(key: String) {
+        lock.withLock {
+            guard let count = claims[key] else { return }
+            if count <= 1 {
+                claims.removeValue(forKey: key)
+            } else {
+                claims[key] = count - 1
+            }
+        }
+    }
+
+    private static func key(for url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+}
+
+/// A session-owned lease. The capture session releases it only after its
+/// coordinator has drained; the controller retains the session through the
+/// later transcription/persistence boundary, so a stopped temporary file is
+/// still protected until ownership has actually transferred or been cleaned.
+final class RecordingCaptureOwnershipLease: @unchecked Sendable {
+    private let registry: RecordingCaptureOwnershipRegistry
+    private let key: String
+    private let lock = NSLock()
+    private var released = false
+
+    fileprivate init(registry: RecordingCaptureOwnershipRegistry, key: String) {
+        self.registry = registry
+        self.key = key
+    }
+
+    func release() {
+        let shouldRelease = lock.withLock {
+            guard !released else { return false }
+            released = true
+            return true
+        }
+        if shouldRelease {
+            registry.release(key: key)
+        }
+    }
+}

@@ -65,7 +65,7 @@ release decision.
 
 ## Validation lanes
 
-The shared `OpenSuperWhisper` scheme runs the 100-test unit target and skips
+The shared `OpenSuperWhisper` scheme runs the 118-test unit target and skips
 the template/UI target. The `OpenSuperWhisperUI` shared scheme is a separate,
 serialized lane. Ordinary CI runs on the official `macos-26` arm64 image with
 Xcode 26.6, asserts macOS/SDK/architecture, resolves from the workspace lock,

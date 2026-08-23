@@ -8,7 +8,8 @@ case "$MODE" in
         cat <<'EOF'
 Usage: ./run.sh [build|test|run]
 
-  build  Build the Debug app without launching it.
+  build  Build the Debug app without launching it. Locally signs it when an
+         Apple Development identity is available.
   test   Build and run the OpenSuperWhisperTests unit target.
   run    Build and launch the Debug app (the default for local use).
 
@@ -25,6 +26,26 @@ EOF
 esac
 
 set -o pipefail
+
+sign_debug_app_if_possible() {
+    local app_bundle="$PWD/build/Build/Products/Debug/OpenSuperWhisper.app"
+    local signing_identity="${OPEN_SUPER_WHISPER_SIGN_IDENTITY:-}"
+
+    if [[ -z "$signing_identity" ]] && command -v security &> /dev/null; then
+        signing_identity="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development:/ { print $2; exit }')"
+    fi
+
+    if [[ -z "$signing_identity" ]]; then
+        echo "Warning: no Apple Development identity found; Debug app remains unsigned."
+        return 0
+    fi
+
+    echo "Signing Debug app for stable macOS privacy permissions..."
+    codesign --force --deep --sign "$signing_identity" \
+        --entitlements "$PWD/OpenSuperWhisper/OpenSuperWhisper.entitlements" \
+        --identifier ru.starmel.OpenSuperWhisper "$app_bundle"
+    codesign --verify --deep --strict "$app_bundle"
+}
 
 # Build or test the app. Generated state stays below build/, which is ignored
 # by Git. The explicit cloned package path keeps CI and cache-free verification
@@ -65,6 +86,7 @@ if [[ $BUILD_STATUS -eq 0 ]]; then
         echo "Tests successful!"
         exit 0
     fi
+    sign_debug_app_if_possible || exit $?
     echo "Building successful!"
     if [[ "$MODE" == "build" ]]; then
         exit 0

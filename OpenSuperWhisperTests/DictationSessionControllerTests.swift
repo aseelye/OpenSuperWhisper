@@ -764,6 +764,7 @@ final class DictationSessionControllerTests: XCTestCase {
         }
 
         var pastedText: String?
+        var copiedText: String?
         let controller = DictationSessionController(
             captureFactory: TestCapture(recordingURL: sourceURL),
             providerFactory: { _, _ in TestProvider(session: TestLiveSession(
@@ -772,17 +773,27 @@ final class DictationSessionControllerTests: XCTestCase {
             recordingStore: UnavailableRecordingStoreSpy(recoveryDirectory: recoveryDirectory),
             settingsProvider: { Self.testSettings() },
             recordingDirectory: outputDirectory,
-            pasteHandler: { pastedText = $0 }
+            pasteHandler: { pastedText = $0 },
+            copyHandler: { copiedText = $0 }
         )
 
-        let result = try await controller.transcribeFile(at: sourceURL, duration: 1)
+        let token = try XCTUnwrap(controller.reserve(
+            source: .importedFile,
+            pasteOnCompletion: true
+        ))
+        let result = try await controller.transcribeFile(
+            at: sourceURL,
+            duration: 1,
+            token: token
+        )
 
         XCTAssertEqual(result.transcript.text, "kept despite history")
         XCTAssertEqual(controller.state, .succeeded)
         XCTAssertEqual(controller.lastTerminalOutcome, .succeededWithHistoryWarning)
         XCTAssertEqual(controller.snapshot.outcome, .succeededWithHistoryWarning)
         XCTAssertNotNil(controller.historyWarning)
-        XCTAssertEqual(pastedText, "kept despite history")
+        XCTAssertNil(pastedText)
+        XCTAssertEqual(copiedText, "kept despite history")
         XCTAssertTrue(FileManager.default.fileExists(atPath: sourceURL.path))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(
             at: outputDirectory,
@@ -792,6 +803,64 @@ final class DictationSessionControllerTests: XCTestCase {
             at: recoveryDirectory,
             includingPropertiesForKeys: nil
         ).filter { $0.pathExtension.lowercased() == "m4a" }.count, 1)
+    }
+
+    func testUnavailableHistoryDoesNotMoveImportedSourceWhenManagedCopyFails() async throws {
+        let sourceURL = try temporaryAudioFile(fileExtension: "m4a")
+        let outputDirectory = try temporaryDirectory()
+        let recoveryDirectory = try temporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: sourceURL)
+            try? FileManager.default.removeItem(at: outputDirectory)
+            try? FileManager.default.removeItem(at: recoveryDirectory)
+        }
+
+        // Keep the directory present so `persist` reaches the managed-copy
+        // operation, then make that copy fail without removing the imported
+        // source. Restore permissions before the cleanup defer removes it.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o500)],
+            ofItemAtPath: outputDirectory.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o700)],
+                ofItemAtPath: outputDirectory.path
+            )
+        }
+
+        let controller = DictationSessionController(
+            captureFactory: TestCapture(recordingURL: sourceURL),
+            providerFactory: { _, _ in TestProvider(session: TestLiveSession(
+                finalTranscript: Transcript(text: "copy must fail", localeIdentifier: "en-US")
+            )) },
+            recordingStore: UnavailableRecordingStoreSpy(recoveryDirectory: recoveryDirectory),
+            settingsProvider: { Self.testSettings() },
+            recordingDirectory: outputDirectory
+        )
+
+        do {
+            _ = try await controller.transcribeFile(at: sourceURL, duration: 1)
+            XCTFail("Expected managed copy to fail")
+        } catch {
+            // The copy error is a normal persistence failure, not a degraded
+            // history success, even though the store reports unavailable.
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sourceURL.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(
+            at: outputDirectory,
+            includingPropertiesForKeys: nil
+        ).count, 0)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(
+            at: recoveryDirectory,
+            includingPropertiesForKeys: nil
+        ).count, 0)
+        if case .failed = controller.state {
+            // Expected terminal state.
+        } else {
+            XCTFail("A managed-copy failure must not report degraded success")
+        }
     }
 
     func testLiveInputOverflowPreservesCaptureInRecoveryBeforeFailure() async throws {

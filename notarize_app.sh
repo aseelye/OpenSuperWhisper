@@ -180,6 +180,8 @@ assert_not_symlink "$DERIVED_DATA_DIR"
 
 PROJECT_FILE="$PROJECT_ROOT/OpenSuperWhisper.xcodeproj/project.pbxproj"
 [ -f "$PROJECT_FILE" ] || die "Xcode project settings not found: $PROJECT_FILE"
+PROJECT_PATH="$PROJECT_ROOT/OpenSuperWhisper.xcodeproj"
+[ -d "$PROJECT_PATH" ] || die "Xcode project bundle not found: $PROJECT_PATH"
 PROJECT_FILE_REL=${PROJECT_FILE#"$PROJECT_ROOT"/}
 
 require_tool git
@@ -244,6 +246,7 @@ rm -f "$DMG_PATH" "$DMG_SHA_PATH" "$DSYM_ZIP_PATH" "$APP_ZIP_PATH"
 
 BUILD_LOG="$DERIVED_DATA_DIR/xcodebuild.log"
 XCODEBUILD_ARGS=(
+    -project "$PROJECT_PATH"
     -scheme "$APP_NAME"
     -configuration Release
     -destination "platform=macOS,arch=arm64"

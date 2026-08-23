@@ -379,6 +379,7 @@ final class DictationSessionController: ObservableObject {
     private let settingsProvider: () -> Settings
     private let recordingDirectory: URL?
     private let pasteHandler: (String) -> Void
+    private let copyHandler: (String) -> Void
     private let recordingStartedHandler: () -> Void
     private let diagnosticSink: any TranscriptionDiagnosticSink
 
@@ -398,6 +399,7 @@ final class DictationSessionController: ObservableObject {
         settingsProvider: @escaping () -> Settings = { Settings() },
         recordingDirectory: URL? = nil,
         pasteHandler: @escaping (String) -> Void = ClipboardUtil.insertTextUsingPasteboard,
+        copyHandler: @escaping (String) -> Void = ClipboardUtil.copyTextToPasteboard,
         recordingStartedHandler: @escaping () -> Void = { AudioRecorder.shared.playRecordingStartSound() },
         diagnosticSink: any TranscriptionDiagnosticSink = LoggerTranscriptionDiagnosticSink.shared
     ) {
@@ -407,6 +409,7 @@ final class DictationSessionController: ObservableObject {
         self.settingsProvider = settingsProvider
         self.recordingDirectory = recordingDirectory
         self.pasteHandler = pasteHandler
+        self.copyHandler = copyHandler
         self.recordingStartedHandler = recordingStartedHandler
         self.diagnosticSink = diagnosticSink
     }
@@ -1120,7 +1123,14 @@ final class DictationSessionController: ObservableObject {
             // managed location, so move that owned copy into Recovery and
             // return a successful result carrying a nonfatal warning. A
             // cancellation always wins over this degraded-success path.
-            if !context.cancellationRequested,
+            // A history outage is only a degraded-success case after the
+            // audio has been transferred into the managed directory. Before
+            // that point, `recordingStore.status` must not reinterpret a
+            // FileManager copy failure as a storage failure: for imported
+            // audio, Recovery would otherwise move the user's original URL.
+            if context.transferCompleted,
+               context.ownedAudioURL != nil,
+               !context.cancellationRequested,
                !Self.isCancellation(error),
                isHistoryUnavailable(error) {
                 var rowCompensationError: Error?
@@ -1201,15 +1211,22 @@ final class DictationSessionController: ObservableObject {
         // Snapshot and clear operation-owned resources before invoking any
         // external callback. A callback may synchronously reserve a
         // replacement operation.
-        let shouldPaste = context.pasteOnCompletion || historyWarning != nil
-        let textToPaste = result.transcript.text
+        // A history warning is a degraded-success fallback, not a request to
+        // inject text into whichever application currently has focus. Keep
+        // the transcript on the clipboard in that mode, even when the
+        // operation also carried an explicit paste intent.
+        let shouldCopy = warning != nil
+        let shouldPaste = warning == nil && context.pasteOnCompletion
+        let textToDeliver = result.transcript.text
         context.pasteOnCompletion = false
         context.ownedAudioURL = nil
         context.sourceAudioURL = nil
         context.destinationAudioURL = nil
         clearContext(context, finalState: .succeeded)
-        if shouldPaste {
-            pasteHandler(textToPaste)
+        if shouldCopy {
+            copyHandler(textToDeliver)
+        } else if shouldPaste {
+            pasteHandler(textToDeliver)
         }
     }
 

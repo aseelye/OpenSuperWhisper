@@ -47,7 +47,7 @@ cover JSON/content-type validation, language and keyword normalization,
 parallel client isolation, retries, cancellation, chunk subdivision/overlap,
 upload progress, safety limits, cleanup diagnostics, and native operation
 handles. Network fixtures use per-test identifiers and do not contact OpenAI.
-Run the full 100-test unit target serially and in parallel; run the focused
+Run the full 118-test unit target serially and in parallel; run the focused
 provider/capture suites separately, with Thread Sanitizer where the host
 supports it. The release shell harness and syntax checks are independent of
 the API tests.

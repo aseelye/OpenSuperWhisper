@@ -498,6 +498,7 @@ private final class AudioCaptureTapReceiver: @unchecked Sendable {
 public final class AudioCaptureSession: DictationAudioCaptureSession, @unchecked Sendable {
     private let state: AudioCaptureAdmissionState
     private let coordinator: AudioCaptureSessionCoordinator
+    private let captureOwnership: RecordingCaptureOwnershipLease
     public let generation: UInt64
 
     public convenience init(
@@ -522,6 +523,8 @@ public final class AudioCaptureSession: DictationAudioCaptureSession, @unchecked
         fileURL: URL?,
         serviceLease: AudioCaptureServiceLease?
     ) {
+        let resolvedDestination = fileURL ?? configuration.temporaryDirectory
+            .appendingPathComponent("recording-\(UUID().uuidString).wav")
         let state = AudioCaptureAdmissionState(generation: generation)
         let writerQueue = DispatchQueue(
             label: "ru.starmel.OpenSuperWhisper.audio-writer.\(generation).\(UUID().uuidString)",
@@ -534,11 +537,14 @@ public final class AudioCaptureSession: DictationAudioCaptureSession, @unchecked
         )
         self.state = state
         self.generation = generation
+        self.captureOwnership = RecordingCaptureOwnershipRegistry.shared.acquire(
+            resolvedDestination
+        )
         self.coordinator = AudioCaptureSessionCoordinator(
             configuration: configuration,
             dependencies: dependencies,
             generation: generation,
-            destinationURL: fileURL,
+            destinationURL: resolvedDestination,
             state: state,
             receiver: receiver,
             writerQueue: writerQueue,
@@ -572,8 +578,10 @@ public final class AudioCaptureSession: DictationAudioCaptureSession, @unchecked
         // deinit itself never performs blocking teardown.
         state.requestTermination(.cancel)
         let coordinator = coordinator
+        let captureOwnership = captureOwnership
         Task {
             await coordinator.cancelAndDrain()
+            captureOwnership.release()
         }
     }
 
